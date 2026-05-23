@@ -1,0 +1,26 @@
+{
+  "spring_boot_url": "http://127.0.0.1:8080/api/wechat/reply",
+  "listen_contacts": [
+    "你的主微信备注名"
+  ],
+  "listen_groups": [
+    "测试群"
+  ],
+  "group_trigger_prefixes": [
+    "@bot",
+    "bot ",
+    "小助手"
+  ],
+  "poll_interval_seconds": 1.0,
+  "request_timeout_seconds": 30.0,
+  "reply_prefix": "",
+  "weixin_path": "",
+  "maximize_main_window": false,
+  "chat_open_wait_seconds": 0.8,
+  "search_result_timeout_seconds": 0.6,
+  "send_delay_seconds": 0.2,
+  "focus_window_wait_seconds": 0.8,
+  "debug_save_images": false,
+  "max_processed_messages": 500,
+  "ignore_self_messages": true
+}

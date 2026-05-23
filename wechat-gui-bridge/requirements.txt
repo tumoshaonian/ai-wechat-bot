@@ -1,0 +1,8 @@
+requests>=2.31,<3
+numpy>=2.0,<3
+Pillow>=10,<13
+psutil>=5.9,<8
+PyAutoGUI>=0.9.54,<1
+pyperclip>=1.9,<2
+pywin32>=311
+rapidocr_onnxruntime>=1.2,<2
