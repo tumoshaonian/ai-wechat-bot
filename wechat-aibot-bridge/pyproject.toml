@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-wechat-aibot-bridge"
+version = "0.1.0"
+description = "Enterprise WeChat AI Bot long-connection adapter for ai-wechat-bot"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27,<1",
+    "python-dotenv>=1,<2",
+    "wecom-aibot-sdk>=1.0.8,<2",
+]
+
+[project.optional-dependencies]
+harness = [
+    "deepseek-harness-sdk",
+]
+
+[project.scripts]
+wechat-aibot-bridge = "wechat_agent.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"

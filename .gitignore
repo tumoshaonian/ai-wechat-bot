@@ -35,4 +35,15 @@ build/
 ### Python ###
 __pycache__/
 *.pyc
+.venv/
+.harness-sessions/
+.uv-cache/
+.m2/
+*.egg-info/
+.runtime/
+java-backend.*.log
+wecom-bridge.*.log
 wechat-gui-bridge/config.json
+scripts/screenshot.ps1
+
+.env
