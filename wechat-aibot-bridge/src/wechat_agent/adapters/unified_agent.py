@@ -63,11 +63,25 @@ class UnifiedAgentBackend:
         """Let Harness choose between a direct answer and an available tool."""
 
         content = message.content.strip()
+        policy = dict(message.access_policy)
         direct_file = _strip_prefix(content, "/文件")
         if direct_file is not None:
+            if policy and (
+                policy.get("can_read_files") is False
+                or policy.get("can_send_files") is False
+            ):
+                return "当前账号没有读取并发送本地文件的权限。"
             return _direct_file_reply(direct_file)
 
-        desktop_file = self._desktop_files.resolve(content)
+        desktop_file = (
+            self._desktop_files.resolve(content)
+            if not policy
+            or (
+                policy.get("can_read_files") is not False
+                and policy.get("can_send_files") is not False
+            )
+            else None
+        )
         if desktop_file is not None:
             return desktop_file
 
@@ -75,6 +89,8 @@ class UnifiedAgentBackend:
         if forced_computer is not None:
             if not forced_computer:
                 return "现在不必添加 /电脑 前缀；直接描述问题或需要执行的任务即可。"
+            if policy and policy.get("can_use_computer") is False:
+                return "当前账号没有操作电脑的权限。"
             content = forced_computer
 
         forced_chat = _strip_prefix(content, "/聊天")
@@ -85,7 +101,50 @@ class UnifiedAgentBackend:
                 "本条消息只允许进行知识回答，不得调用任何工具或修改电脑。\n"
                 f"用户问题：{forced_chat}"
             )
+        elif policy:
+            restrictions: list[str] = []
+            if policy.get("can_use_computer") is False:
+                restrictions.append("不得调用任何电脑、桌面或其他工具，只能文本回答")
+            else:
+                if policy.get("can_read_files") is False:
+                    restrictions.append("不得读取本地文件")
+                if policy.get("can_send_files") is False:
+                    restrictions.append("不得发送任何本地文件")
+                if policy.get("can_execute_commands") is False:
+                    restrictions.append("不得执行命令、脚本或启动进程")
+            if restrictions:
+                content = (
+                    "必须遵守本条由后台授权策略生成的限制："
+                    + "；".join(restrictions)
+                    + "。\n用户请求："
+                    + content
+                )
         return await self._harness.reply(replace(message, content=content))
+
+    async def abort_session(self, chat_session_id: str) -> None:
+        """Stop and rotate work whose WeCom response stream is no longer usable."""
+
+        await self._harness.stop_session(chat_session_id)
+
+    async def cancel_task(self, task_id: str) -> dict[str, object]:
+        """Cancel one exact running task requested by the administration plane."""
+
+        interrupted, status = await self._harness.stop_task(task_id)
+        return {
+            "interrupted": interrupted,
+            "generation": status.generation if status is not None else None,
+            "state": status.state if status is not None else "not_running",
+        }
+
+    async def end_chat_session(self, chat_session_id: str) -> dict[str, object]:
+        """End a logical chat session while preserving its prior generations."""
+
+        interrupted, status = await self._harness.end_session(chat_session_id)
+        return {
+            "interrupted": interrupted,
+            "generation": status.generation,
+            "state": status.state,
+        }
 
     async def close(self) -> None:
         await self._harness.close()

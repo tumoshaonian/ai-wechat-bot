@@ -9,8 +9,11 @@ description = "Enterprise WeChat AI Bot long-connection adapter for ai-wechat-bo
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "cryptography>=42,<51",
+    "fastapi>=0.115,<1",
     "httpx>=0.27,<1",
     "python-dotenv>=1,<2",
+    "uvicorn>=0.30,<1",
     "wecom-aibot-sdk>=1.0.8,<2",
 ]
 
@@ -21,6 +24,7 @@ harness = [
 
 [project.scripts]
 wechat-aibot-bridge = "wechat_agent.__main__:main"
+wechat-aibot-admin = "wechat_agent.admin.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

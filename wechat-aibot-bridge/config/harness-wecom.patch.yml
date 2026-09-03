@@ -1,0 +1,45 @@
+# Invocation overlay for the shipped DeepSeek Harness `sdk` profile.
+# The profile owns the model, persistence, filesystem/shell tools and JSON-RPC
+# lifecycle.  This patch only supplies the WeCom persona and the local Desktop
+# MCP server.  stdout remains reserved for the SDK protocol.
+
+- id: system-prompt
+  config:
+    persona: !!js process.env.DSH_SYSTEM_PROMPT ?? 'You are a WeCom computer agent.'
+
+# Python Session.run returns when the root Agent becomes idle. Keep delegated
+# work foreground/one-shot so a WeCom reply cannot finish while a continuable
+# child is still operating the computer in the background.
+- id: tool-subagent
+  config:
+    provider: spawn
+    toolName: subagent
+    backgroundMode: one-shot
+
+- insert:
+    - id: desktop-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      disabled: !!js process.env.DSH_DESKTOP_ENABLED !== 'true'
+      config:
+        serverName: desktop
+        transport: stdio
+        command: !!js process.env.DSH_DESKTOP_PYTHON
+        args: ['-m', 'wechat_agent.desktop.mcp_server']
+        cwd: !!js process.env.DSH_DESKTOP_PROJECT_ROOT ?? process.cwd()
+        env:
+          PYTHONUTF8: '1'
+          PYTHONUNBUFFERED: '1'
+          DSH_DESKTOP_POWERSHELL: !!js process.env.DSH_DESKTOP_POWERSHELL
+          DSH_DESKTOP_UIA_SCRIPT: !!js process.env.DSH_DESKTOP_UIA_SCRIPT
+          DSH_DESKTOP_ACTION_TIMEOUT_SECONDS: !!js process.env.DSH_DESKTOP_ACTION_TIMEOUT_SECONDS
+          DSH_DESKTOP_SCREENSHOT_DIR: !!js process.env.DSH_DESKTOP_SCREENSHOT_DIR
+          DSH_DESKTOP_LOG_FILE: !!js process.env.DSH_DESKTOP_LOG_FILE
+          DSH_DESKTOP_LOG_LEVEL: !!js process.env.DSH_DESKTOP_LOG_LEVEL ?? 'INFO'
+          DSH_DOUBAO_LAUNCH_PATH: !!js process.env.DSH_DOUBAO_LAUNCH_PATH ?? ''
+        toolCallTimeoutMs: !!js Number.parseInt(process.env.DSH_DESKTOP_TOOL_TIMEOUT_MS ?? '210000', 10)
+        failOnStartupError: true
+        reconnect:
+          enabled: true
+          initialDelayMs: 500
+          maxDelayMs: 30000
+          maxAttempts: 10

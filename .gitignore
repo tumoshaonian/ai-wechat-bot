@@ -43,6 +43,10 @@ __pycache__/
 .runtime/
 java-backend.*.log
 wecom-bridge.*.log
+desktop-worker.log
+admin-api.*.log
+local-supervisor.log
+/test-artifacts/
 wechat-gui-bridge/config.json
 scripts/screenshot.ps1
 

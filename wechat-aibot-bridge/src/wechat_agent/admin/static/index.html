@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f7f8fa">
+  <meta name="description" content="微信电脑 Agent 控制台">
+  <title>微信电脑 Agent · 管理后台</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./api.js" defer></script>
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <div id="boot-screen" class="boot-screen" aria-live="polite">
+    <div class="boot-mark" aria-hidden="true">
+      <span></span><span></span><span></span>
+    </div>
+    <p>正在连接控制台…</p>
+  </div>
+
+  <main id="auth-screen" class="auth-screen" hidden>
+    <section class="auth-brand" aria-label="产品介绍">
+      <div class="auth-brand-inner">
+        <div class="brand-lockup brand-lockup-light">
+          <span class="brand-symbol" aria-hidden="true">微</span>
+          <span><strong>微信电脑 Agent</strong><small>CONTROL PLANE</small></span>
+        </div>
+        <div class="auth-copy">
+          <span class="eyebrow">你的本机智能控制中心</span>
+          <h1>每一次对话和操作，<br>都清楚、可控、可追溯。</h1>
+          <p>集中管理微信连接、Agent 任务、电脑工具和文件交付，让远程操作真正可靠。</p>
+        </div>
+        <div class="auth-capabilities" aria-hidden="true">
+          <div><span>01</span><strong>统一观测</strong><small>消息、任务、工具一条链路</small></div>
+          <div><span>02</span><strong>安全控制</strong><small>权限、审计与敏感信息保护</small></div>
+          <div><span>03</span><strong>实时反馈</strong><small>状态、进度和错误即时可见</small></div>
+        </div>
+      </div>
+    </section>
+    <section class="auth-panel">
+      <div class="auth-card">
+        <div class="mobile-brand brand-lockup">
+          <span class="brand-symbol" aria-hidden="true">微</span>
+          <span><strong>微信电脑 Agent</strong><small>CONTROL PLANE</small></span>
+        </div>
+        <div id="login-view">
+          <div class="auth-heading">
+            <span class="eyebrow">ADMIN CONSOLE</span>
+            <h2>欢迎回来</h2>
+            <p>登录后管理机器人和本机 Agent。</p>
+          </div>
+          <form id="login-form" class="form-stack" novalidate>
+            <label class="field">
+              <span>管理员账号</span>
+              <input id="login-username" name="username" autocomplete="username" maxlength="80" required placeholder="请输入账号">
+              <small class="field-error"></small>
+            </label>
+            <label class="field">
+              <span>密码</span>
+              <span class="password-wrap">
+                <input id="login-password" name="password" type="password" autocomplete="current-password" maxlength="256" required placeholder="请输入密码">
+                <button class="password-toggle" type="button" data-toggle-password="login-password" aria-label="显示密码">显示</button>
+              </span>
+              <small class="field-error"></small>
+            </label>
+            <div id="login-error" class="form-alert" role="alert" hidden></div>
+            <button class="btn btn-primary btn-block" type="submit">
+              <span>登录控制台</span><span aria-hidden="true">→</span>
+            </button>
+          </form>
+        </div>
+
+        <div id="setup-view" hidden>
+          <div class="auth-heading">
+            <span class="eyebrow">FIRST RUN</span>
+            <h2>创建超级管理员</h2>
+            <p>这是首次启动。账号只保存在你的电脑上。</p>
+          </div>
+          <form id="setup-form" class="form-stack" novalidate>
+            <label class="field">
+              <span>显示名称</span>
+              <input name="display_name" autocomplete="name" maxlength="80" required placeholder="例如：管理员">
+              <small class="field-error"></small>
+            </label>
+            <label class="field">
+              <span>管理员账号</span>
+              <input name="username" autocomplete="username" minlength="3" maxlength="80" required placeholder="至少 3 个字符">
+              <small class="field-error"></small>
+            </label>
+            <label class="field">
+              <span>密码</span>
+              <span class="password-wrap">
+                <input id="setup-password" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="256" required placeholder="至少 12 个字符">
+                <button class="password-toggle" type="button" data-toggle-password="setup-password" aria-label="显示密码">显示</button>
+              </span>
+              <small class="field-error"></small>
+            </label>
+            <label class="field">
+              <span>确认密码</span>
+              <input name="password_confirm" type="password" autocomplete="new-password" minlength="12" maxlength="256" required placeholder="再次输入密码">
+              <small class="field-error"></small>
+            </label>
+            <div id="setup-error" class="form-alert" role="alert" hidden></div>
+            <button class="btn btn-primary btn-block" type="submit">
+              <span>创建并进入控制台</span><span aria-hidden="true">→</span>
+            </button>
+          </form>
+        </div>
+        <p class="auth-footnote"><span class="status-dot status-dot-ok"></span> 默认仅通过本机地址访问</p>
+      </div>
+    </section>
+  </main>
+
+  <div id="app-shell" class="app-shell" hidden>
+    <div id="mobile-scrim" class="mobile-scrim" hidden></div>
+    <aside id="sidebar" class="sidebar">
+      <div class="sidebar-brand brand-lockup">
+        <span class="brand-symbol" aria-hidden="true">微</span>
+        <span><strong>微信电脑 Agent</strong><small>CONTROL PLANE</small></span>
+        <button id="sidebar-close" class="icon-btn mobile-only" aria-label="关闭菜单">×</button>
+      </div>
+      <nav id="primary-nav" class="primary-nav" aria-label="主导航"></nav>
+      <div class="sidebar-footer">
+        <div id="sidebar-health" class="sidebar-health">
+          <span class="health-orb"></span>
+          <span><strong>正在检查服务</strong><small>等待健康状态</small></span>
+        </div>
+        <button id="collapse-sidebar" class="sidebar-collapse" type="button" aria-label="收起侧边栏">
+          <span aria-hidden="true">‹</span><span>收起菜单</span>
+        </button>
+      </div>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button id="menu-toggle" class="icon-btn mobile-only" type="button" aria-label="打开菜单">☰</button>
+          <div>
+            <h1 id="page-title">总览</h1>
+            <p id="page-subtitle">机器人运行态势与关键指标</p>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <div id="live-state" class="live-state" title="实时事件连接状态">
+            <span></span><span class="live-label">实时连接</span>
+          </div>
+          <button id="refresh-page" class="icon-btn" type="button" title="刷新当前页面" aria-label="刷新当前页面">↻</button>
+          <button id="theme-toggle" class="icon-btn" type="button" title="切换主题" aria-label="切换主题">◐</button>
+          <button id="alerts-button" class="icon-btn notification-button" type="button" title="查看异常任务" aria-label="查看异常任务">⌁<span id="alerts-badge" hidden>0</span></button>
+          <div class="user-menu-wrap">
+            <button id="user-menu-button" class="user-chip" type="button" aria-haspopup="menu" aria-expanded="false">
+              <span id="user-avatar" class="avatar">管</span>
+              <span class="user-chip-copy"><strong id="user-display-name">管理员</strong><small id="user-role">超级管理员</small></span>
+              <span aria-hidden="true">⌄</span>
+            </button>
+            <div id="user-menu" class="popover user-menu" role="menu" hidden>
+              <button type="button" data-route="settings" role="menuitem">系统设置</button>
+              <button id="logout-button" type="button" class="danger-text" role="menuitem">退出登录</button>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main id="page-content" class="page-content" tabindex="-1"></main>
+    </section>
+  </div>
+
+  <aside id="drawer" class="drawer" aria-label="详情" aria-hidden="true">
+    <div class="drawer-header">
+      <div><span id="drawer-eyebrow" class="eyebrow"></span><h2 id="drawer-title">详情</h2></div>
+      <button id="drawer-close" class="icon-btn" type="button" aria-label="关闭详情">×</button>
+    </div>
+    <div id="drawer-body" class="drawer-body"></div>
+  </aside>
+  <div id="drawer-scrim" class="drawer-scrim" hidden></div>
+
+  <dialog id="modal" class="modal">
+    <div class="modal-card">
+      <header>
+        <div><span id="modal-eyebrow" class="eyebrow"></span><h2 id="modal-title">确认操作</h2></div>
+        <button class="icon-btn" type="button" data-modal-close aria-label="关闭">×</button>
+      </header>
+      <div id="modal-body" class="modal-body"></div>
+      <footer id="modal-footer" class="modal-footer"></footer>
+    </div>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
+  <noscript>此管理后台需要启用 JavaScript。</noscript>
+</body>
+</html>

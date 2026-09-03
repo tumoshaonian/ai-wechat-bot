@@ -36,8 +36,8 @@ class FakeHarnessBackend:
         self.closed = True
 
 
-def message(content: str) -> IncomingMessage:
-    return IncomingMessage("m-1", "owner", "owner", "single", content)
+def message(content: str, **kwargs) -> IncomingMessage:
+    return IncomingMessage("m-1", "owner", "owner", "single", content, **kwargs)
 
 
 class UnifiedAgentBackendTests(unittest.IsolatedAsyncioTestCase):
@@ -79,6 +79,27 @@ class UnifiedAgentBackendTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(AgentReply("已找到文件，准备发送：report.docx", (path.resolve(),)), reply)
             self.assertEqual([], self.harness.messages)
+
+    async def test_user_policy_blocks_direct_file_and_computer_operations(self) -> None:
+        denied = {
+            "can_use_computer": False,
+            "can_read_files": False,
+            "can_send_files": False,
+            "can_execute_commands": False,
+        }
+        file_reply = await self.agent.reply(
+            message('/文件 "D:/report.docx"', access_policy=denied)
+        )
+        computer_reply = await self.agent.reply(
+            message("/电脑 打开记事本", access_policy=denied)
+        )
+        await self.agent.reply(
+            message("怎么打开记事本", access_policy=denied)
+        )
+
+        self.assertIn("没有读取", file_reply)
+        self.assertIn("没有操作电脑", computer_reply)
+        self.assertIn("不得调用任何电脑", self.harness.messages[-1].content)
 
 
 if __name__ == "__main__":

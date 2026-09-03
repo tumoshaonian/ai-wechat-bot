@@ -41,6 +41,20 @@ class HarnessSessionRegistryTests(unittest.TestCase):
             content = (root / "bridge-conversations.json").read_text(encoding="utf-8")
             self.assertNotIn("secret-user", content)
 
+    def test_clean_bridge_restart_resumes_the_same_durable_session(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first_registry = HarnessSessionRegistry(root)
+            first = first_registry.begin("wecom:single:owner")
+            first_registry.finish(first)
+
+            restarted_registry = HarnessSessionRegistry(root)
+            restarted = restarted_registry.begin("wecom:single:owner")
+
+            self.assertEqual(first.session_id, restarted.session_id)
+            self.assertTrue(restarted.session_id.endswith("-g0001"))
+            self.assertFalse(restarted.recovered_interrupted_session)
+
 
 if __name__ == "__main__":
     unittest.main()

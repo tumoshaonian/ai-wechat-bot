@@ -165,3 +165,62 @@ class MessageProcessorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("ended", True)], control_responder.updates)
         backend.release.set()
         await running
+
+    async def test_progress_stream_failure_aborts_backend_without_second_reply(self) -> None:
+        class AbortableBackend(FakeBackend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.aborted = False
+
+            async def reply(self, incoming: IncomingMessage) -> str:
+                await asyncio.Event().wait()
+                return "unreachable"
+
+            async def abort_session(self, _chat_session_id: str) -> None:
+                self.aborted = True
+
+        class ExpiredResponder(FakeResponder):
+            async def send(self, text: str, *, finish: bool) -> None:
+                if self.updates:
+                    raise RuntimeError("stream update expired")
+                await super().send(text, finish=finish)
+
+        backend = AbortableBackend()
+        responder = ExpiredResponder()
+        processor = MessageProcessor(
+            backend,
+            progress_interval_seconds=0.01,
+            task_timeout_seconds=1,
+        )
+
+        await processor.handle(message(), responder)
+
+        self.assertTrue(backend.aborted)
+        self.assertEqual([("收到，正在处理…", False)], responder.updates)
+
+    async def test_task_deadline_aborts_before_wecom_stream_expiry(self) -> None:
+        class AbortableBackend(FakeBackend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.aborted = False
+
+            async def reply(self, incoming: IncomingMessage) -> str:
+                await asyncio.Event().wait()
+                return "unreachable"
+
+            async def abort_session(self, _chat_session_id: str) -> None:
+                self.aborted = True
+
+        backend = AbortableBackend()
+        responder = FakeResponder()
+        processor = MessageProcessor(
+            backend,
+            progress_interval_seconds=0.01,
+            task_timeout_seconds=0.04,
+        )
+
+        await processor.handle(message(), responder)
+
+        self.assertTrue(backend.aborted)
+        self.assertTrue(responder.updates[-1][1])
+        self.assertIn("为避免企业微信消息通道过期", responder.updates[-1][0])

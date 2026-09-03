@@ -1,8 +1,8 @@
 """Domain types shared by message channels and agent backends."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Mapping
 
 
 ChatType = Literal["single", "group"]
@@ -38,6 +38,10 @@ class IncomingMessage:
     chat_id: str
     chat_type: ChatType
     content: str
+    connection_id: str = "default"
+    task_id: str | None = None
+    trace_id: str | None = None
+    access_policy: Mapping[str, object] = field(default_factory=dict)
 
     @property
     def session_id(self) -> str:

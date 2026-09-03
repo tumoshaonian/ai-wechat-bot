@@ -32,6 +32,8 @@ class HarnessConversationStatus:
 class HarnessSessionRegistry:
     """Persist the current Harness generation separately from Harness event logs."""
 
+    STATE_VERSION = 2
+
     def __init__(self, session_root: Path) -> None:
         self._path = session_root / "bridge-conversations.json"
         self._lock = threading.RLock()
@@ -42,16 +44,26 @@ class HarnessSessionRegistry:
         chat_key = _chat_key(chat_session_id)
         with self._lock:
             state = self._load()
+            conversations = state.setdefault("conversations", {})
+            record_exists = isinstance(conversations.get(chat_key), dict)
             record = _record(state, chat_key)
             generation = _generation(record)
             recovered = record.get("state") == "running"
+            migrated = record_exists and state.get("version") != self.STATE_VERSION
             if recovered:
                 generation += 1
+            state["version"] = self.STATE_VERSION
             state["conversations"][chat_key] = {
                 "generation": generation,
                 "state": "running",
                 "updatedAt": _now(),
-                "previousState": "interrupted" if recovered else record.get("previousState"),
+                "previousState": (
+                    "interrupted"
+                    if recovered
+                    else "stable-session-id-migration"
+                    if migrated
+                    else record.get("previousState")
+                ),
             }
             self._save(state)
         return HarnessSessionLease(
@@ -87,6 +99,7 @@ class HarnessSessionRegistry:
                 "updatedAt": _now(),
                 "previousState": reason,
             }
+            state["version"] = self.STATE_VERSION
             self._save(state)
         return HarnessConversationStatus(generation=generation, state="idle")
 
@@ -101,15 +114,19 @@ class HarnessSessionRegistry:
 
     def _load(self) -> dict[str, Any]:
         if not self._path.is_file():
-            return {"version": 1, "conversations": {}}
+            return {"version": self.STATE_VERSION, "conversations": {}}
         try:
             value = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"version": 1, "conversations": {}}
+            return {"version": self.STATE_VERSION, "conversations": {}}
         conversations = value.get("conversations") if isinstance(value, dict) else None
         if not isinstance(conversations, dict):
             conversations = {}
-        return {"version": 1, "conversations": conversations}
+        version = value.get("version") if isinstance(value, dict) else None
+        return {
+            "version": version if isinstance(version, int) else 1,
+            "conversations": conversations,
+        }
 
     def _save(self, state: dict[str, Any]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -137,6 +154,8 @@ def _chat_key(chat_session_id: str) -> str:
 
 
 def _harness_session_id(chat_key: str, generation: int) -> str:
+    """Return a durable id that survives clean Bridge/Runtime restarts."""
+
     return f"wecom-{chat_key}-g{generation:04d}"
 
 
