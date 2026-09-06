@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol
 from ..domain import AgentReply, AgentTaskInterrupted, IncomingMessage, UserVisibleError
 from ..ports import ChatBackend
 from ..conversation_journal import ConversationJournal
+from ..history_recovery import recover_context
+from .harness_summary import summarize_history
 from ..session_registry import HarnessConversationStatus, HarnessSessionLease, HarnessSessionRegistry
 from ..telemetry import NULL_EVENT_RECORDER, EventRecorder, safe_record
 
@@ -85,6 +87,7 @@ class DeepSeekHarnessBackend(ChatBackend):
         self._tool_names: dict[str, str] = {}
         self._progress: dict[str, str] = {}
         self._unresolved_tool_failures: set[str] = set()
+        self._recovering: tuple[str, asyncio.Task, str | None] | None = None
         self._interrupt_requested_for: set[str] = set()
         self._closed = False
 
@@ -161,10 +164,33 @@ class DeepSeekHarnessBackend(ChatBackend):
             self._progress[message.session_id] = "Agent 正在分析请求"
             self._unresolved_tool_failures.clear()
             key = (message.session_id, epoch)
-            history, _ = self._journal.context(
-                message.session_id, epoch, self._history_offsets.get(key, 0),
-                getattr(self._settings, "harness_recovery_max_bytes", 196608),
-            )
+            self._recovering = (message.session_id, asyncio.current_task(), message.task_id)
+            try:
+                history, _ = await recover_context(
+                    self._journal, message.session_id, epoch, self._history_offsets.get(key, 0),
+                    getattr(self._settings, "harness_recovery_max_bytes", 196608),
+                    lambda prompt: summarize_history(self._settings, prompt),
+                    lambda text: self._progress.__setitem__(message.session_id, text),
+                )
+            except asyncio.CancelledError:
+                self._delivery_epochs.pop(delivery_key, None)
+                if self._consume_interrupt(message.session_id):
+                    raise AgentTaskInterrupted("历史恢复已停止，本次操作未执行。") from None
+                raise
+            except BaseException as exc:
+                self._delivery_epochs.pop(delivery_key, None)
+                self._record_agent_event(message, "agent.history.failed", {
+                    "epoch": epoch, "error_code": getattr(exc, "code", "HISTORY_RECOVERY_FAILED"),
+                    "computer_action_started": False,
+                }, severity="ERROR")
+                raise
+            finally:
+                self._recovering = None
+            if history:
+                self._record_agent_event(message, "agent.history.recovered", {
+                    "epoch": epoch, "bytes": len(history.encode("utf-8")),
+                    "mode": "channel_reconstruction", "native_resume": False,
+                })
             content = message.content
             ticket = self._task_tickets.get(message.task_id)
             if ticket:
@@ -486,7 +512,9 @@ class DeepSeekHarnessBackend(ChatBackend):
 
     def is_busy(self, chat_session_id: str) -> bool:
         with self._runtime_guard:
-            return self._active_chat_session_id == chat_session_id
+            return self._active_chat_session_id == chat_session_id or (
+                self._recovering is not None and self._recovering[0] == chat_session_id
+            )
 
     def session_status(self, chat_session_id: str) -> HarnessConversationStatus:
         return self._registry.status(chat_session_id)
@@ -505,6 +533,9 @@ class DeepSeekHarnessBackend(ChatBackend):
     ) -> tuple[bool, HarnessConversationStatus | None]:
         """Stop the exact active task without cancelling a newer task by accident."""
 
+        recovery = self._recovering
+        if recovery is not None and recovery[2] == task_id:
+            return await self.stop_session(recovery[0])
         with self._runtime_guard:
             if self._active_task_id != task_id:
                 return False, None
@@ -522,6 +553,13 @@ class DeepSeekHarnessBackend(ChatBackend):
         return interrupted, self._registry.rotate(chat_session_id, reason="ended")
 
     async def interrupt_session(self, chat_session_id: str) -> bool:
+        recovery = self._recovering
+        if recovery is not None and recovery[0] == chat_session_id:
+            if chat_session_id not in self._interrupt_requested_for:
+                self._interrupt_requested_for.add(chat_session_id)
+                recovery[1].cancel()
+            await asyncio.shield(asyncio.gather(recovery[1], return_exceptions=True))
+            return True
         with self._runtime_guard:
             if self._active_chat_session_id != chat_session_id:
                 return False
@@ -549,6 +587,9 @@ class DeepSeekHarnessBackend(ChatBackend):
         if self._closed:
             return
         self._closed = True
+        recovery = self._recovering
+        if recovery is not None:
+            await self.interrupt_session(recovery[0])
         await asyncio.to_thread(self._close_runtime_sync)
         await asyncio.to_thread(self._executor.shutdown, True, cancel_futures=True)
         if self._broker is not None:

@@ -85,6 +85,6 @@ Python 虚拟环境位于项目根目录。从项目根目录运行：
 
 对话上下文可以跨多条消息连续使用，但任务执行状态独立管理；Bridge 异常退出后会自动隔离未正常结束的会话。企业微信流式消息 10 分钟后失效，因此 Bridge 默认在 480 秒主动停止超长任务并提交明确结果；流本身失效时也会同步终止 Harness 和 Desktop Worker。详细配置见 [`wechat-aibot-bridge/README.md`](wechat-aibot-bridge/README.md)。
 
-当前 SDK 不把冷启动的同名 session 自动恢复为旧会话。Bridge 使用独立 Runtime ID 避免日志冲突，并从 `channel-history.sqlite3` 重建本版开始记录的渠道事实（用户请求、模型回复、交付回执），不是完整工具事件恢复。恢复历史超过 `HARNESS_RECOVERY_MAX_BYTES` 时明确停止，不静默截断；旧版日志不会自动导入。活跃 Harness 会话由原生 compaction 管理。Bridge 在连接企业微信前初始化 SDK Profile 和 Desktop MCP。
+当前 SDK 不把冷启动的同名 session 自动恢复为旧会话。Bridge 使用独立 Runtime ID 避免日志冲突，并从 `channel-history.sqlite3` 重建本版开始记录的渠道事实（用户请求、模型回复、交付回执），不是完整工具事件恢复。超过 `HARNESS_RECOVERY_MAX_BYTES` 时尝试有界摘要加近期完整轮次，原始记录保留；摘要失败、单轮过大或达到整理上限时明确停止。摘要是有损压缩，不保证保留每个细节；旧版日志不会自动导入。活跃 Harness 会话由原生 compaction 管理。Bridge 在连接企业微信前初始化 SDK Profile 和 Desktop MCP。
 
 本轮改动、测试与未完成项见 [稳定性实施记录](docs/agent-reliability-implementation.md)。

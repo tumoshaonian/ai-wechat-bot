@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from wechat_agent.adapters.deepseek_harness import (
     DeepSeekHarnessBackend,
@@ -18,7 +19,7 @@ from wechat_agent.adapters.deepseek_harness import (
     _normalize_error_code,
     _redact_harness_detail,
 )
-from wechat_agent.domain import AgentReply, IncomingMessage, UserVisibleError
+from wechat_agent.domain import AgentReply, AgentTaskInterrupted, IncomingMessage, UserVisibleError
 
 
 class FakeHarness:
@@ -35,6 +36,45 @@ class FakeHarness:
 
 
 class DeepSeekHarnessBackendTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stop_and_end_interrupt_history_recovery_before_computer_actions(self):
+        for command in ("stop", "end"):
+            with self.subTest(command=command), TemporaryDirectory() as temporary:
+                harness = FakeHarness()
+                backend = DeepSeekHarnessBackend(
+                    SimpleNamespace(harness_session_root=Path(temporary), harness_recovery_max_bytes=4096),
+                    harness_factory=lambda _: harness,
+                )
+                message = IncomingMessage("recover", "owner", "owner", "single", "新任务", task_id="recover-task")
+                for i in range(10):
+                    backend.delivery_store.append(message.session_id, 1, "user", f"旧项目{i} " + "历史" * 130)
+                    backend.delivery_store.append(message.session_id, 1, "assistant", "已生成但未发送")
+                started = asyncio.Event()
+                async def blocked_summary(*_):
+                    started.set()
+                    await asyncio.Event().wait()
+                try:
+                    with patch("wechat_agent.adapters.deepseek_harness.summarize_history", blocked_summary):
+                        task = asyncio.create_task(backend.reply(message))
+                        await asyncio.wait_for(started.wait(), 2)
+                        self.assertTrue(backend.is_busy(message.session_id))
+                        self.assertEqual((False, None), await backend.stop_task("another-task"))
+                        if command == "end":
+                            interrupted, _ = await backend.end_session(message.session_id)
+                        else:
+                            interrupted, _ = await backend.stop_task("recover-task")
+                        self.assertTrue(interrupted)
+                        with self.assertRaises(AgentTaskInterrupted):
+                            await task
+                    self.assertFalse(backend.is_busy(message.session_id))
+                    self.assertEqual([], harness.calls)
+                    self.assertEqual(2 if command == "end" else 1, backend.delivery_store.epoch(message.session_id))
+                    if command == "stop":
+                        await backend.end_session(message.session_id)
+                    await backend.reply(message)
+                    self.assertNotIn("旧项目", harness.calls[0][0])
+                finally:
+                    await backend.close()
+
     def test_create_harness_uses_current_profile_sdk_contract(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
