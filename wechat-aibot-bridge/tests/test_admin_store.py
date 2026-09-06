@@ -21,6 +21,53 @@ class AdminStoreTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_terminal_tasks_cannot_be_reopened_or_rewritten_by_late_events(self):
+        for terminal in ("task.completed", "task.failed", "task.cancelled", "task.timeout"):
+            task_id = terminal
+            self.store.record_event("task.started", trace_id=task_id, payload={"task_id": task_id})
+            self.store.record_event(terminal, trace_id=task_id, payload={"task_id": task_id, "result": "original"})
+            before = self.store.task_detail(task_id)
+            for late in ("task.progress", "task.started", "task.queued", "task.completed", "task.failed"):
+                self.store.record_event(late, trace_id=task_id, payload={"task_id": task_id, "result": "late", "error_code": "LATE"})
+            after = self.store.task_detail(task_id)
+            for field in ("status", "finished_at", "duration_ms", "result_summary", "error_code", "updated_at"):
+                self.assertEqual(before[field], after[field], (terminal, field))
+            self.assertEqual(len(before["events"]) + 5, len(after["events"]))
+
+    def test_cancel_request_survives_progress_until_worker_confirms_outcome(self):
+        self.store.record_event("task.started", trace_id="cancel", payload={"task_id": "cancel"})
+        self.store.enqueue_task_cancel("cancel", "cancel-once", "admin", None)
+        self.store.record_event("task.progress", trace_id="cancel", payload={"task_id": "cancel"})
+        self.assertEqual("CANCEL_REQUESTED", self.store.task_detail("cancel")["status"])
+        self.store.record_event("task.cancelled", trace_id="cancel", payload={"task_id": "cancel"})
+        self.assertEqual("CANCELLED", self.store.task_detail("cancel")["status"])
+
+    def test_execution_result_survives_restart_before_channel_reply(self):
+        self.store.record_event("task.started", trace_id="crash", payload={"task_id": "crash"})
+        self.store.record_event("agent.execution.completed", trace_id="crash", payload={"task_id": "crash", "result": "created document", "execution_state": "succeeded"})
+        self.store.reconcile_interrupted_tasks()
+        self.store.record_event("task.progress", trace_id="crash", payload={"task_id": "crash"})
+        detail = self.store.task_detail("crash")
+        self.assertEqual("INTERRUPTED", detail["status"])
+        self.assertEqual("created document", detail["result_summary"])
+        self.assertEqual("succeeded", detail["outcome"]["execution_state"])
+        self.assertEqual("unknown", detail["outcome"]["response_status"])
+
+    def test_task_duration_excludes_queue_time(self):
+        from unittest.mock import patch
+        with patch("wechat_agent.admin.store.utcnow", return_value="2026-09-06T01:00:00+00:00"):
+            self.store.record_event("task.queued", trace_id="duration", payload={"task_id": "duration"})
+        self.assertIsNone(self.store.task_detail("duration")["started_at"])
+        with patch("wechat_agent.admin.store.utcnow", return_value="2026-09-06T01:01:00+00:00"):
+            self.store.record_event("task.started", trace_id="duration", payload={"task_id": "duration"})
+        with patch("wechat_agent.admin.store.utcnow", return_value="2026-09-06T01:01:02+00:00"):
+            self.store.record_event("task.completed", trace_id="duration", payload={"task_id": "duration"})
+        self.assertEqual(2000, self.store.task_detail("duration")["duration_ms"])
+
+    def test_unknown_task_events_do_not_create_phantom_running_tasks(self):
+        self.store.record_event("task.unrecognized", trace_id="unknown", payload={"task_id": "unknown"})
+        self.assertEqual(0, self.store.list_page("tasks", page=1, page_size=20)["total"])
+
     def test_password_hash_and_secret_envelope_are_not_plaintext(self) -> None:
         encoded = hash_password("StrongPassword!123")
         self.assertNotIn("StrongPassword!123", encoded)

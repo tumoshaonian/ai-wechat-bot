@@ -26,6 +26,7 @@
   ];
 
   const STATUS = {
+    UNKNOWN: ["结果未知", "warning"], NOT_ATTEMPTED: ["尚未尝试", "neutral"],
     ACTIVE: ["正常", "success"], ONLINE: ["在线", "success"], READY: ["就绪", "success"], HEALTHY: ["健康", "success"],
     SUCCEEDED: ["成功", "success"], SENT: ["已发送", "success"], AVAILABLE: ["可用", "success"], ALLOWED: ["已授权", "success"],
     RUNNING: ["运行中", "info"], QUEUED: ["排队中", "info"], RECEIVED: ["已接收", "info"], CONNECTING: ["连接中", "info"],
@@ -795,7 +796,7 @@
   }
 
   async function renderTasks(id, signal) {
-    setPage(pageHeading("任务中心", "定位每个请求的真实执行状态、失败阶段和工具调用") + filterBar({ placeholder: "搜索请求、结果或错误…", statuses: ["RUNNING", "WAITING_CONFIRMATION", "SUCCEEDED", "PARTIAL_SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED", "INTERRUPTED"] }) + loadingPanel());
+    setPage(pageHeading("任务中心", "定位每个请求的真实执行状态、失败阶段和工具调用") + filterBar({ placeholder: "搜索请求、结果或错误…", statuses: ["QUEUED", "RUNNING", "CANCEL_REQUESTED", "WAITING_CONFIRMATION", "SUCCEEDED", "PARTIAL_SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED", "INTERRUPTED"] }) + loadingPanel());
     const page = asPage(await api.get("/tasks", queryParams(), { signal }));
     if (!stillRendering(id)) return;
     const activeStatuses = ["RECEIVED", "QUEUED", "RUNNING", "WAITING_CONFIRMATION", "CANCEL_REQUESTED"];
@@ -804,7 +805,7 @@
       <td>${statusBadge(item.status)}</td><td>${h(formatDuration(item.duration_ms))}</td><td class="${item.error_code ? "text-danger" : "muted"}">${h(item.error_code || "—")}</td><td>${h(formatDate(item.updated_at || item.created_at))}</td>
       <td><div class="row-actions"><button class="btn btn-sm" data-action="view-task" data-id="${h(item.id)}">详情</button>${can("tasks.control") && activeStatuses.includes(String(item.status).toUpperCase()) ? `<button class="btn btn-sm danger-text" data-action="cancel-task" data-id="${h(item.id)}">停止</button>` : ""}</div></td>
     </tr>`).join("");
-    setPage(`${pageHeading("任务中心", "定位每个请求的真实执行状态、失败阶段和工具调用")}${filterBar({ placeholder: "搜索请求、结果或错误…", statuses: ["RUNNING", "WAITING_CONFIRMATION", "SUCCEEDED", "PARTIAL_SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED", "INTERRUPTED"], summary: `共 ${page.total} 个任务` })}<section class="panel">${page.items.length ? `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>请求 / Trace</th><th>状态</th><th>耗时</th><th>错误码</th><th>更新时间</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>${pagination(page)}` : emptyState("没有匹配的 Agent 任务", "调整筛选条件，或等待用户发来新的请求。")}</section>`);
+    setPage(`${pageHeading("任务中心", "定位每个请求的真实执行状态、失败阶段和工具调用")}${filterBar({ placeholder: "搜索请求、结果或错误…", statuses: ["QUEUED", "CANCEL_REQUESTED", "RUNNING", "WAITING_CONFIRMATION", "SUCCEEDED", "PARTIAL_SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED", "INTERRUPTED"], summary: `共 ${page.total} 个任务` })}<section class="panel">${page.items.length ? `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>请求 / Trace</th><th>状态</th><th>耗时</th><th>错误码</th><th>更新时间</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>${pagination(page)}` : emptyState("没有匹配的 Agent 任务", "调整筛选条件，或等待用户发来新的请求。")}</section>`);
   }
 
   async function taskDetail(id) {
@@ -814,18 +815,23 @@
       $("#drawer-title").textContent = clipped(task.request_summary, 34) || "Agent 任务";
       const events = task.events || [];
       const tools = task.tool_calls || [];
+      const outcome = task.outcome || {};
       const active = ["RECEIVED", "QUEUED", "RUNNING", "WAITING_CONFIRMATION", "CANCEL_REQUESTED"].includes(String(task.status).toUpperCase());
       $("#drawer-body").innerHTML = `<div class="detail-grid">
         ${detailField("状态", statusBadge(task.status), true)}${detailField("耗时", formatDuration(task.duration_ms))}
+        ${detailField("Agent 执行结果", statusBadge(outcome.execution_state || "UNKNOWN"), true)}${detailField("最终回复回执", statusBadge(outcome.response_status || "UNKNOWN"), true)}
+        ${detailField("失败阶段", outcome.failure_stage || "—")}
         ${detailField("创建时间", formatFullDate(task.created_at))}${detailField("完成时间", formatFullDate(task.finished_at))}
         ${detailField("Task ID", `<span class="mono">${h(task.id)}</span>`, true, true)}${detailField("Trace ID", `<span class="mono">${h(task.trace_id)}</span>`, true, true)}
         ${detailField("请求摘要", h(task.request_summary || "—"), true, true)}${detailField("结果摘要", h(task.result_summary || "—"), true, true)}
         ${task.error_code || task.error_message ? detailField("失败信息", `<span class="text-danger">${h(task.error_code || "UNKNOWN")} · ${h(task.error_message || "未提供错误详情")}</span>`, true, true) : ""}
       </div>
+      <p class="muted">执行结果来自 Agent，具体操作请核对工具证据；回复回执与文件交付分别记录。未知不等于失败，请勿自动重做任务。</p>
       ${can("tasks.control") && active ? `<div class="mt-16"><button class="btn btn-danger" data-action="cancel-task" data-id="${h(task.id)}">停止当前任务</button></div>` : ""}
       <section class="detail-section"><h3 class="detail-section-title">执行时间线</h3>${events.length ? `<div class="timeline">${events.map(eventTimelineItem).join("")}</div>` : emptyState("暂无结构化事件", "任务存在，但执行阶段尚未写入事件流。")}</section>
       <section class="detail-section"><h3 class="detail-section-title">工具调用（${tools.length}）</h3>${tools.length ? `<div class="timeline">${tools.map(toolTimelineItem).join("")}</div>` : emptyState("没有工具调用", "这可能是一条纯文本回答，或工具事件尚未接入。")}</section>
       ${task.artifacts?.length ? `<section class="detail-section"><h3 class="detail-section-title">文件产物</h3>${task.artifacts.map((file) => `<div class="detail-field" style="margin-bottom:8px"><span>${h(file.kind || "file")}</span><strong>${h(file.name)} · ${h(formatBytes(file.size_bytes))}</strong></div>`).join("")}</section>` : ""}`;
+      if (task.deliveries?.length) $("#drawer-body").insertAdjacentHTML("beforeend", `<section class="detail-section"><h3 class="detail-section-title">文件交付回执</h3>${task.deliveries.map((delivery) => `<div class="detail-field"><span>${h(delivery.id)}</span><strong>${statusBadge(delivery.status)} ${h(delivery.error_message || "")}</strong></div>`).join("")}</section>`);
     } catch (error) { $("#drawer-body").innerHTML = errorState(error); }
   }
 

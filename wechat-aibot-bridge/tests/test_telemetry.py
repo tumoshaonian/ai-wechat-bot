@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from wechat_agent.adapters.deepseek_harness import DeepSeekHarnessBackend
 from wechat_agent.application import MessageProcessor
-from wechat_agent.domain import IncomingMessage
+from wechat_agent.domain import AgentReply, IncomingMessage
 
 
 class RecordingEvents:
@@ -51,6 +51,66 @@ class Responder:
 
 
 class TelemetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_store_keeps_delivery_separate_from_lost_final_reply(self):
+        from wechat_agent.admin.store import AdminStore
+        from wechat_agent.admin.security import SecretBox
+        for upload_fails in (False, True):
+            with self.subTest(upload_fails=upload_fails), TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                store = AdminStore(root / "admin.db", SecretBox.load(root / "key"))
+                class Recorder:
+                    record_event = store.record_event
+                    claim_message = store.claim_message
+                path = root / "result.txt"
+                path.write_text("test artifact", encoding="utf-8")
+                class Backend(EchoBackend):
+                    async def reply(self, message):
+                        self.calls.append(message)
+                        return AgentReply("文档已生成", files=(path,))
+                class Channel(Responder):
+                    async def send(self, text, *, finish):
+                        if finish:
+                            raise RuntimeError("final ack lost")
+                    async def send_file(self, path):
+                        if upload_fails:
+                            raise RuntimeError("upload ack lost")
+                backend = Backend()
+                incoming = IncomingMessage("integration", "owner", "owner", "single", "create and send")
+                await MessageProcessor(backend, event_recorder=Recorder()).handle(incoming, Channel())
+                task = store.task_detail(backend.calls[0].task_id)
+                self.assertEqual("PARTIAL_SUCCEEDED", task["status"])
+                self.assertEqual("文档已生成", task["result_summary"])
+                self.assertEqual("succeeded", task["outcome"]["execution_state"])
+                self.assertEqual("unknown", task["outcome"]["response_status"])
+                self.assertEqual("UNKNOWN" if upload_fails else "SENT", task["deliveries"][0]["status"])
+                with store.database.connect() as db:
+                    last = db.execute("SELECT status FROM messages WHERE direction='OUTBOUND' ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()[0]
+                self.assertEqual("UNKNOWN", last)
+                store.reconcile_interrupted_tasks()
+                await MessageProcessor(backend, event_recorder=Recorder()).handle(incoming, Channel())
+                self.assertEqual(1, len(backend.calls))
+
+    async def test_final_response_failure_preserves_execution_and_prevents_replay(self):
+        class FinalBrokenResponder(Responder):
+            async def send(self, text, *, finish):
+                if finish:
+                    raise RuntimeError("ack lost")
+                await super().send(text, finish=finish)
+        recorder = RecordingEvents()
+        backend = EchoBackend()
+        message = IncomingMessage("final-lost", "owner", "owner", "single", "create document")
+        await MessageProcessor(backend, event_recorder=recorder).handle(message, FinalBrokenResponder())
+        events = [(name, data["payload"]) for name, data in recorder.events]
+        execution = next(payload for name, payload in events if name == "agent.execution.completed")
+        terminal = next(payload for name, payload in events if name == "task.completed")
+        self.assertEqual("完成", execution["result"])
+        self.assertEqual("partial_succeeded", terminal["state"])
+        self.assertEqual("unknown", terminal["response_status"])
+        self.assertEqual("succeeded", terminal["execution_state"])
+        self.assertEqual("完成", terminal["result"])
+        await MessageProcessor(backend, event_recorder=recorder).handle(message, Responder())
+        self.assertEqual(1, len(backend.calls))
+
     async def test_message_task_and_outbound_events_share_trace(self) -> None:
         recorder = RecordingEvents()
         backend = EchoBackend()

@@ -13,6 +13,7 @@ from typing import Any, Iterator
 from .database import Database
 from .redaction import redact_data, redact_text
 from .security import SecretBox, hash_password, token_hash, verify_password
+from .task_lifecycle import TERMINAL_STATES, projected_state, task_evidence
 
 
 ALL_PERMISSIONS = {
@@ -284,7 +285,13 @@ class AdminStore:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO messages(id,connection_id,conversation_id,external_message_id,direction,content,status,task_id,trace_id,created_at) VALUES(?,?,?,?, 'OUTBOUND',?,?,?,?,?)",
-                (_stable_id("message", connection_id, ext_id, "out"), connection_id, conversation_id, ext_id, redact_text(str(payload.get("content") or payload.get("text") or "")), str(payload.get("status") or "SENT"), payload.get("task_id"), trace_id or payload.get("trace_id"), now),
+                (_stable_id("message", connection_id, ext_id, "out"), connection_id, conversation_id, ext_id, redact_text(str(payload.get("content") or payload.get("text") or "")), str(payload.get("status") or ("UNKNOWN" if event_type == "message.outbound.failed" else "SENT")), payload.get("task_id"), trace_id or payload.get("trace_id"), now),
+            )
+        elif event_type == "agent.execution.completed":
+            # Save execution evidence before attempting delivery/final response.
+            connection.execute(
+                "UPDATE agent_tasks SET result_summary=? WHERE id=? AND finished_at IS NULL",
+                (redact_text(str(payload.get("result") or ""), max_length=8192), payload.get("task_id")),
             )
         elif event_type.startswith("task."):
             self._project_task(connection, event_type, now, trace_id, payload)
@@ -307,7 +314,7 @@ class AdminStore:
             )
         if event_type in {
             "task.failed", "task.timeout", "connection.failed", "system.error",
-            "connection.authentication_failed", "artifact.delivery.failed",
+            "connection.authentication_failed", "artifact.delivery.failed", "artifact.delivery.unknown", "message.outbound.failed",
         }:
             connection.execute(
                 "INSERT OR IGNORE INTO alerts(id,alert_type,severity,status,title,message,trace_id,resource_type,resource_id,created_at,updated_at) VALUES(?,?,?,'OPEN',?,?,?,?,?,?,?)",
@@ -339,18 +346,19 @@ class AdminStore:
             if external_message_id
             else None
         )
-        status_map = {"task.started": "RUNNING", "task.completed": "SUCCEEDED", "task.failed": "FAILED", "task.cancelled": "CANCELLED", "task.timeout": "TIMED_OUT", "task.progress": "RUNNING"}
-        status = status_map.get(event_type, str(payload.get("status") or "RUNNING").upper())
-        declared_state = str(payload.get("state") or payload.get("status") or "").upper()
-        if event_type == "task.completed" and declared_state in {
-            "PARTIAL_SUCCEEDED", "PARTIALLY_SUCCEEDED", "PARTIAL_SUCCESS"
-        }:
-            status = "PARTIAL_SUCCEEDED"
+        existing = connection.execute("SELECT status,started_at FROM agent_tasks WHERE id=?", (task_id,)).fetchone()
+        status = projected_state(existing["status"] if existing else None, event_type, payload)
+        if status is None:
+            return
         started = now if event_type == "task.started" else payload.get("started_at")
-        finished = now if status in {"SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT", "PARTIAL_SUCCEEDED", "INTERRUPTED"} else None
+        finished = now if status in TERMINAL_STATES else None
+        duration = payload.get("duration_ms")
+        actual_start = existing["started_at"] if existing else started
+        if duration is None and finished and actual_start:
+            duration = max(0, int((parse_time(finished) - parse_time(actual_start)).total_seconds() * 1000))
         connection.execute(
             "INSERT INTO agent_tasks(id,trace_id,conversation_id,message_id,status,request_summary,result_summary,error_code,error_message,created_at,started_at,finished_at,duration_ms,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET conversation_id=COALESCE(agent_tasks.conversation_id,excluded.conversation_id),message_id=COALESCE(agent_tasks.message_id,excluded.message_id),status=excluded.status,result_summary=CASE WHEN excluded.result_summary<>'' THEN excluded.result_summary ELSE agent_tasks.result_summary END,error_code=COALESCE(excluded.error_code,agent_tasks.error_code),error_message=COALESCE(excluded.error_message,agent_tasks.error_message),started_at=COALESCE(agent_tasks.started_at,excluded.started_at),finished_at=COALESCE(excluded.finished_at,agent_tasks.finished_at),duration_ms=COALESCE(excluded.duration_ms,agent_tasks.duration_ms),updated_at=excluded.updated_at",
-            (task_id, trace, conversation_id, message_id, status, redact_text(str(payload.get("content") or payload.get("request") or ""), max_length=4096), redact_text(str(payload.get("result") or payload.get("reply") or ""), max_length=8192), payload.get("error_code"), redact_text(str(payload.get("error") or ""), max_length=4096) or None, now, started, finished, payload.get("duration_ms"), now),
+            (task_id, trace, conversation_id, message_id, status, redact_text(str(payload.get("content") or payload.get("request") or ""), max_length=4096), redact_text(str(payload.get("result") or payload.get("reply") or ""), max_length=8192), payload.get("error_code"), redact_text(str(payload.get("error") or ""), max_length=4096) or None, now, started, finished, duration, now),
         )
 
     def _project_tool(self, connection: sqlite3.Connection, event_type: str, now: str, trace_id: str | None, payload: dict[str, Any]) -> None:
@@ -376,7 +384,7 @@ class AdminStore:
 
     def _project_delivery(self, connection: sqlite3.Connection, event_type: str, now: str, trace_id: str | None, payload: dict[str, Any]) -> None:
         delivery_id = str(payload.get("delivery_id") or _stable_id("delivery", trace_id or "", str(payload.get("artifact_id") or payload.get("path") or uuid.uuid4())))
-        status = {"artifact.delivery.started": "UPLOADING", "artifact.delivery.succeeded": "SENT", "artifact.delivery.failed": "FAILED"}.get(event_type, str(payload.get("status") or "PENDING").upper())
+        status = {"artifact.delivery.started": "UPLOADING", "artifact.delivery.succeeded": "SENT", "artifact.delivery.failed": "FAILED", "artifact.delivery.unknown": "UNKNOWN"}.get(event_type, str(payload.get("status") or "PENDING").upper())
         connection.execute(
             "INSERT INTO file_deliveries(id,artifact_id,task_id,trace_id,status,media_id_masked,error_code,error_message,retry_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,media_id_masked=excluded.media_id_masked,error_code=excluded.error_code,error_message=excluded.error_message,retry_count=excluded.retry_count,updated_at=excluded.updated_at",
             (delivery_id, payload.get("artifact_id"), payload.get("task_id"), trace_id or payload.get("trace_id"), status, _mask(str(payload.get("media_id") or "")) or None, payload.get("error_code"), redact_text(str(payload.get("error") or "")) or None, int(payload.get("retry_count") or 0), now, now),
@@ -565,6 +573,7 @@ class AdminStore:
             task["artifacts"] = [_clean_row(dict(row)) for row in connection.execute("SELECT * FROM file_artifacts WHERE task_id=? ORDER BY created_at", (task_id,))]
             task["deliveries"] = [_clean_row(dict(row)) for row in connection.execute("SELECT * FROM file_deliveries WHERE task_id=? ORDER BY created_at", (task_id,))]
             task["events"] = [self._event_row(row) for row in connection.execute("SELECT * FROM event_stream WHERE trace_id=? ORDER BY seq", (task["trace_id"],))]
+        task["outcome"] = task_evidence(task["events"], task_id)
         return task
 
     # Agent configuration versions -------------------------------------------

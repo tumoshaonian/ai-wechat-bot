@@ -145,7 +145,7 @@ class _ObservedResponder:
         except Exception as exc:
             safe_record(
                 self._recorder,
-                "artifact.delivery.failed",
+                "artifact.delivery.unknown",
                 trace_id=self._message.trace_id,
                 actor_type="robot",
                 actor_id=self._message.connection_id,
@@ -271,7 +271,7 @@ class MessageProcessor:
             access_policy=self._load_access_policy(message),
         )
 
-        self._record_task(message, "task.started", {"state": "running"})
+        self._record_task(message, "task.queued", {"state": "queued"})
 
         control_handler = getattr(self._backend, "handle_control", None)
         if callable(control_handler):
@@ -320,6 +320,7 @@ class MessageProcessor:
 
         lock = self._conversation_locks.setdefault(message.session_id, asyncio.Lock())
         async with lock:
+            self._record_task(message, "task.started", {"state": "running"})
             try:
                 await responder.send("收到，正在处理…", finish=False)
             except Exception:
@@ -350,6 +351,11 @@ class MessageProcessor:
                 text = reply.text.strip()
                 if not text and not reply.files:
                     raise RuntimeError("chat backend returned an empty reply")
+                self._record_task(message, "agent.execution.completed", {
+                    "execution_state": reply.status, "result": text,
+                    "response_status": "not_attempted",
+                    "meaning": "Agent 返回的执行结果，不等于文件交付或微信回复已确认。",
+                })
             except AgentTaskInterrupted:
                 LOGGER.info("Agent task stopped for message_id=%s", message.message_id)
                 self._record_task(message, "task.cancelled", {"state": "cancelled"})
@@ -422,11 +428,15 @@ class MessageProcessor:
                     })
                     self._record_task(
                         message,
-                        "task.failed",
+                        "task.completed",
                         {
-                            "state": "failed",
+                            "state": "partial_succeeded",
                             "failure_stage": "response",
                             "error_code": "FILE_NOTICE_SEND_FAILED",
+                            "execution_state": reply.status,
+                            "response_status": "unknown",
+                            "result": text,
+                            "error": "Agent 已返回结果，但文件发送提示未确认；剩余文件未尝试交付，不要自动重做执行步骤。",
                         },
                         severity="ERROR",
                     )
@@ -468,11 +478,15 @@ class MessageProcessor:
                 )
                 self._record_task(
                     message,
-                    "task.failed",
+                    "task.completed",
                     {
-                        "state": "failed",
+                        "state": "partial_succeeded",
                         "failure_stage": "response",
                         "error_code": "FINAL_RESPONSE_SEND_FAILED",
+                        "execution_state": reply.status,
+                        "response_status": "unknown",
+                        "result": text,
+                        "error": "Agent 已返回结果，但最后一条微信回复未确认。请核对结果，不要自动重新执行任务。",
                         "delivered_files": delivered,
                         "failed_files": failed,
                     },
@@ -484,6 +498,8 @@ class MessageProcessor:
                 "task.completed",
                 {
                     "state": "partial_succeeded" if failed else reply.status,
+                    "execution_state": reply.status,
+                    "response_status": "sent",
                     "result": text,
                     "delivered_files": delivered,
                     "failed_files": failed,
