@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import sys
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,16 @@ def _schema(properties: dict[str, Any], required: tuple[str, ...] = ()) -> dict[
 
 
 TOOLS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "deliver_file",
+        "description": "Send an explicitly selected existing local file to the current task's bound WeCom recipient. Use the current task_ticket supplied with the request. sent means the channel acknowledged delivery, not user read. Unknown outcomes must not be blindly retried. Do not also output a file tag for a file already delivered by this tool.",
+        "inputSchema": _schema({"path": {"type": "string"}, "task_ticket": {"type": "string"}}, ("path", "task_ticket")),
+    },
+    {
+        "name": "prepare_window",
+        "description": "Identify and restore a verified main window, move it into visible screen bounds if necessary, and verify UIA readiness. Does not kill/restart apps; ambiguous targets require a specific title.",
+        "inputSchema": _schema(WINDOW_PROPERTIES, ("process_name",)),
+    },
     {
         "name": "list_windows",
         "description": "List real top-level Windows UI Automation windows. Use this instead of treating a running process as proof that an app is interactive.",
@@ -160,6 +171,8 @@ def _worker_from_environment() -> DesktopWorker:
 
 def _tool_handlers(worker: DesktopWorker) -> dict[str, Any]:
     return {
+        "deliver_file": _deliver_file,
+        "prepare_window": worker.prepare_window,
         "list_windows": worker.list_windows,
         "inspect_window": worker.inspect_window,
         "set_value": worker.set_value,
@@ -167,6 +180,19 @@ def _tool_handlers(worker: DesktopWorker) -> dict[str, Any]:
         "capture": worker.capture,
         "doubao_ask": worker.ask_doubao,
     }
+
+
+def _deliver_file(arguments: dict[str, Any]) -> dict[str, Any]:
+    url = os.environ.get("DSH_DELIVERY_URL", "")
+    token = os.environ.get("DSH_DELIVERY_TOKEN", "")
+    if not url.startswith("http://127.0.0.1:") or not token:
+        raise DesktopWorkerError("当前运行时未连接文件交付服务")
+    data = json.dumps(arguments).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers={
+        "Authorization": "Bearer " + token, "Content-Type": "application/json",
+    })
+    with urllib.request.urlopen(request, timeout=70) as response:
+        return json.loads(response.read(65536))
 
 
 def _success(request_id: Any, result: Any) -> dict[str, Any]:
@@ -234,6 +260,7 @@ def handle_request(
                 "text": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
             }],
             "structuredContent": result,
+            "isError": result.get("ok") is False,
         })
     if request_id is None:
         return None

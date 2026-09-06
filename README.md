@@ -60,7 +60,7 @@ Python 虚拟环境位于项目根目录。从项目根目录运行：
 - `/电脑 ...` 继续兼容，但已经不是必需前缀。
 - `/聊天 ...` 强制本条消息只回答、不调用工具。
 - `end` 或 `/电脑 结束会话` 保留旧记录并切换到不继承上下文的新会话。
-- `/停止` 中断当前 Runtime 并为下一条消息切换新会话。
+- `/停止` 中断当前 Runtime，保留已确认的渠道事实；只有 `end` 清空当前逻辑上下文。
 - `/状态` 查看当前会话代数和任务状态。
 - 直接说“给我发送电脑桌面的 LeapMind 暑假开发计划文档”，机器人会按名称查找桌面文件并发送，不需要命令前缀或绝对路径。
 - 其他位置或需要先生成、压缩的文件由统一 Agent 处理，Bridge 校验最终路径后上传并发送；单文件上限为 50 MiB。
@@ -74,10 +74,10 @@ Python 虚拟环境位于项目根目录。从项目根目录运行：
 - 检查 UI Automation 控件树和支持的 Pattern
 - 通过 `ValuePattern` 写入并回读验证输入
 - 通过 `InvokePattern` 调用按钮
-- 通过目标 HWND 的 `PrintWindow` 截图并作为企业微信文件发送；窗口被其他应用遮挡时也不会误截前台应用，即使模型漏写内部文件标签，Bridge 也会从受信任的成功工具事件中恢复截图
+- 通过目标 HWND 的 `PrintWindow` 截图；仅交付 Agent 明确选中的成果，不自动发送中间截图
 - 豆包问答的端到端事务工具
 
-顶层窗口枚举使用 Win32 `EnumWindows`，优先选取同进程中面积最大的主窗口，再进入 UI Automation 控件树，避免误选 Electron 的辅助浮窗。若豆包未暴露 Chromium 可访问性树，事务工具会仅重启已验证的豆包进程并加入 `--force-renderer-accessibility`，随后重新定位 `ProseMirror` 输入框；不会退化为盲目坐标点击。输入、提交、回答完成和截图分别独立验证，失败日志会标明准确阶段。
+顶层窗口枚举使用 Win32 `EnumWindows`。`prepare_window` 排除辅助窗口，验证进程和 HWND 后恢复最小化或屏幕外的主窗口；多个候选主窗口需要进一步指定标题。豆包问答在定位输入控件前执行窗口准备。无法访问控件时明确失败，不自动杀进程重启或退化为盲目坐标点击。输入、提交、回答和截图分别验证。
 
 默认配置会自动寻找桌面的 `豆包.lnk`。找不到时在 `.env` 设置 `DOUBAO_LAUNCH_PATH`。UIA 运行日志会写入 `desktop-worker.log`，桌面启动器的 Python/Harness 日志页会一并显示。
 
@@ -85,4 +85,6 @@ Python 虚拟环境位于项目根目录。从项目根目录运行：
 
 对话上下文可以跨多条消息连续使用，但任务执行状态独立管理；Bridge 异常退出后会自动隔离未正常结束的会话。企业微信流式消息 10 分钟后失效，因此 Bridge 默认在 480 秒主动停止超长任务并提交明确结果；流本身失效时也会同步终止 Harness 和 Desktop Worker。详细配置见 [`wechat-aibot-bridge/README.md`](wechat-aibot-bridge/README.md)。
 
-当前集成使用新版 Harness 的稳定 `DSH_HOME + session id` 语义：正常重启后继续原会话；只有 `end`、明确停止、任务异常或上次进程未干净退出时才切换会话代数。Bridge 在连接企业微信之前会先初始化 SDK Profile 和 Desktop MCP，配置或运行时损坏会直接写入电脑端日志，不再等到用户发第一条消息后才暴露。
+当前 SDK 不把冷启动的同名 session 自动恢复为旧会话。Bridge 使用独立 Runtime ID 避免日志冲突，并从 `channel-history.sqlite3` 重建本版开始记录的渠道事实（用户请求、模型回复、交付回执），不是完整工具事件恢复。恢复历史超过 `HARNESS_RECOVERY_MAX_BYTES` 时明确停止，不静默截断；旧版日志不会自动导入。活跃 Harness 会话由原生 compaction 管理。Bridge 在连接企业微信前初始化 SDK Profile 和 Desktop MCP。
+
+本轮改动、测试与未完成项见 [稳定性实施记录](docs/agent-reliability-implementation.md)。

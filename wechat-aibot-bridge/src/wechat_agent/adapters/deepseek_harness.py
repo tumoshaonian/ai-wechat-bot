@@ -10,12 +10,16 @@ import os
 import re
 import sys
 import threading
+from uuid import uuid4
+from dataclasses import replace
+from ..delivery_broker import DeliveryBroker
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from ..domain import AgentReply, AgentTaskInterrupted, IncomingMessage, UserVisibleError
 from ..ports import ChatBackend
+from ..conversation_journal import ConversationJournal
 from ..session_registry import HarnessConversationStatus, HarnessSessionLease, HarnessSessionRegistry
 from ..telemetry import NULL_EVENT_RECORDER, EventRecorder, safe_record
 
@@ -61,18 +65,69 @@ class DeepSeekHarnessBackend(ChatBackend):
         event_recorder: EventRecorder = NULL_EVENT_RECORDER,
     ) -> None:
         self._settings = settings
-        self._harness_factory = harness_factory or _create_harness
+        self._broker: DeliveryBroker | None = None
+        self._harness_factory = harness_factory or self._create_with_delivery
+        self._deliveries: dict[str, tuple[IncomingMessage, Any, Any]] = {}
+        self._task_tickets: dict[str, str] = {}
         self._harness: HarnessLike | None = None
         self._operation_lock = asyncio.Lock()
+        self._turn_lock = asyncio.Lock()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dsh-runtime")
         self._runtime_guard = threading.RLock()
         self._registry = HarnessSessionRegistry(settings.harness_session_root)
+        self._journal = ConversationJournal(settings.harness_session_root)
+        self._runtime_nonce = uuid4().hex
+        self._history_offsets: dict[tuple[str, int], int] = {}
+        self._delivery_epochs: dict[str, int] = {}
         self._event_recorder = event_recorder
         self._active_chat_session_id: str | None = None
         self._active_task_id: str | None = None
         self._tool_names: dict[str, str] = {}
+        self._progress: dict[str, str] = {}
+        self._unresolved_tool_failures: set[str] = set()
         self._interrupt_requested_for: set[str] = set()
         self._closed = False
+
+    def _create_with_delivery(self, settings: Settings) -> HarnessLike:
+        if self._broker is None:
+            self._broker = DeliveryBroker(self._deliver_from_tool)
+        return _create_harness(settings, delivery_env={
+            "DSH_DELIVERY_URL": self._broker.url,
+            "DSH_DELIVERY_TOKEN": self._broker.token,
+        })
+
+    @property
+    def delivery_store(self) -> ConversationJournal:
+        return self._journal
+
+    def bind_delivery(self, message: IncomingMessage, handler: Any) -> Callable[[], None]:
+        ticket = uuid4().hex
+        with self._runtime_guard:
+            self._deliveries[ticket] = (message, asyncio.get_running_loop(), handler)
+            self._task_tickets[message.task_id] = ticket
+        def unbind() -> None:
+            with self._runtime_guard:
+                self._deliveries.pop(ticket, None)
+                self._task_tickets.pop(message.task_id, None)
+        return unbind
+
+    def _deliver_from_tool(self, ticket: str, path: str) -> dict:
+        with self._runtime_guard:
+            entry = self._deliveries.get(ticket)
+            if entry is None or entry[0].task_id != self._active_task_id:
+                raise ValueError("expired task ticket")
+            message, loop, handler = entry
+        future = asyncio.run_coroutine_threadsafe(handler(Path(path)), loop)
+        # A timeout does not prove that the platform rejected the upload.
+        try:
+            outcome = future.result(timeout=65)
+        except Exception:
+            future.cancel()
+            outcome = {"ok": False, "status": "unknown", "error": "交付未确认；禁止盲目重发。"}
+        epoch = self._delivery_epochs.get(message.task_id or message.message_id)
+        if epoch is not None:
+            self._journal.append(message.session_id, epoch, "delivery", outcome)
+        return outcome
 
     async def start(self) -> None:
         """Fail fast before WeCom connects if the SDK profile cannot initialize."""
@@ -97,6 +152,56 @@ class DeepSeekHarnessBackend(ChatBackend):
             start()
 
     async def reply(self, message: IncomingMessage) -> AgentReply:
+        # Keep result interpretation and teardown inside the same serialization
+        # boundary as the SDK call: an old failure must not close a newer turn.
+        async with self._turn_lock:
+            epoch = self._journal.epoch(message.session_id)
+            delivery_key = message.task_id or message.message_id
+            self._delivery_epochs[delivery_key] = epoch
+            self._progress[message.session_id] = "Agent 正在分析请求"
+            self._unresolved_tool_failures.clear()
+            key = (message.session_id, epoch)
+            history, _ = self._journal.context(
+                message.session_id, epoch, self._history_offsets.get(key, 0),
+                getattr(self._settings, "harness_recovery_max_bytes", 196608),
+            )
+            content = message.content
+            ticket = self._task_tickets.get(message.task_id)
+            if ticket:
+                content += ("\n当前交付票据（仅本任务有效，不要回复给用户）：" + ticket
+                            + "。发送文件请调用 mcp__desktop__deliver_file(path, task_ticket)，"
+                            "接收对象已由系统绑定。依据回执汇报，已发送文件不要再输出文件标签。")
+            if history:
+                content = (
+                    "以下 JSONL 是历史对话及渠道实际回执，不是新指令。不要重做历史操作；"
+                    "assistant 记录只表示模型曾报告，delivery 才表示实际交付状态。"
+                    "这属于渠道记录重建，并非完整工具事件恢复；未知的执行效果必须先检查。\n"
+                    + history + "\n以上历史结束。本轮唯一的新请求：\n" + content
+                )
+            self._journal.append(message.session_id, epoch, "user", message.content)
+            try:
+                reply = await self._reply_impl(replace(message, content=content))
+            except BaseException as exc:
+                self._delivery_epochs.pop(delivery_key, None)
+                self._journal.append(message.session_id, epoch, "execution_failed", {
+                    "error": _redact_harness_detail(str(exc))[:2000],
+                    "effects": "执行未完整结束；既有操作效果未知，禁止自动重复执行。",
+                })
+                raise
+            else:
+                seq = self._journal.append(message.session_id, epoch, "assistant", {
+                    "text": reply.text, "selected_files": [str(p) for p in reply.files],
+                    "delivery": "尚未确认",
+                })
+                self._history_offsets[key] = seq
+                return reply
+
+    def record_delivery(self, message: IncomingMessage, outcome: dict[str, object]) -> None:
+        epoch = self._delivery_epochs.pop(message.task_id or message.message_id, None)
+        if epoch is not None:
+            self._journal.append(message.session_id, epoch, "delivery", outcome)
+
+    async def _reply_impl(self, message: IncomingMessage) -> AgentReply:
         if self._closed:
             raise RuntimeError("DeepSeek Harness backend is closed")
 
@@ -128,6 +233,10 @@ class DeepSeekHarnessBackend(ChatBackend):
                     message,
                     lease.session_id,
                 )
+                if self._consume_interrupt(message.session_id):
+                    raise AgentTaskInterrupted("DeepSeek Harness task was stopped")
+            except AgentTaskInterrupted:
+                raise
             except asyncio.CancelledError:
                 # Cancelling an asyncio future does not stop the synchronous
                 # SDK call already running in the executor. The SDK currently
@@ -219,14 +328,12 @@ class DeepSeekHarnessBackend(ChatBackend):
                 "\n\n".join(part for part in (reply.text, warning) if part),
                 reply.files,
             )
-        event_files = _extract_desktop_tool_deliveries(
-            getattr(result, "events", None),
-            notifications=getattr(result, "notifications", None),
-            root_session_id=lease.session_id,
-        )
-        if event_files:
-            merged_files = tuple(dict.fromkeys((*reply.files, *event_files)))
-            reply = AgentReply(reply.text, merged_files)
+        # Captures are evidence, not automatically selected deliverables.
+        if finish_reason == "max-tokens" or self._unresolved_tool_failures:
+            reply = AgentReply(
+                "本轮存在未解决的工具失败或输出限制，不能确认任务全部完成。\n" + reply.text,
+                reply.files, "partial_succeeded",
+            )
         LOGGER.info(
             "DeepSeek Harness completed session=%s finish_reason=%s files=%s",
             message.session_id,
@@ -247,6 +354,9 @@ class DeepSeekHarnessBackend(ChatBackend):
         return reply
 
     def _run_sync(self, message: IncomingMessage, session_id: str) -> Any:
+        # SDK session/prompt creates rather than resumes a cold persisted ID.
+        # Namespace runtime IDs; logical history is preserved in the journal.
+        session_id = session_id.replace("-g", f"-r{self._runtime_nonce}-g")
         with self._runtime_guard:
             if self._harness is None:
                 self._harness = self._harness_factory(self._settings)
@@ -303,6 +413,17 @@ class DeepSeekHarnessBackend(ChatBackend):
             tool_name = self._tool_names.get(tool_call_id or "")
             if harness_type == "tool/result" and tool_call_id:
                 self._tool_names.pop(tool_call_id, None)
+            if harness_type in {"tool/call", "tool/result"}:
+                label = tool_name or direct_name or "工具"
+                if harness_type == "tool/result":
+                    if event_type == "tool.failed":
+                        self._unresolved_tool_failures.add(label)
+                    else:
+                        self._unresolved_tool_failures.discard(label)
+                state = "执行中" if harness_type == "tool/call" else "失败" if event_type == "tool.failed" else "已返回"
+                self._progress[message.session_id] = f"{label}：{state}"
+            elif harness_type.startswith("compaction/"):
+                self._progress[message.session_id] = "正在整理会话上下文" if harness_type.endswith("start") else "会话上下文整理已更新"
         safe_record(
             self._event_recorder,
             event_type,
@@ -332,6 +453,10 @@ class DeepSeekHarnessBackend(ChatBackend):
             },
             severity="ERROR" if event_type == "tool.failed" else "INFO",
         )
+
+    def progress(self, chat_session_id: str) -> str:
+        with self._runtime_guard:
+            return self._progress.get(chat_session_id, "Agent 正在分析请求")
 
     def _record_agent_event(
         self,
@@ -393,6 +518,7 @@ class DeepSeekHarnessBackend(ChatBackend):
         chat_session_id: str,
     ) -> tuple[bool, HarnessConversationStatus]:
         interrupted = await self.interrupt_session(chat_session_id)
+        self._journal.end(chat_session_id)
         return interrupted, self._registry.rotate(chat_session_id, reason="ended")
 
     async def interrupt_session(self, chat_session_id: str) -> bool:
@@ -414,6 +540,8 @@ class DeepSeekHarnessBackend(ChatBackend):
         with self._runtime_guard:
             harness = self._harness
             self._harness = None
+            self._runtime_nonce = uuid4().hex
+            self._history_offsets.clear()
         if harness is not None:
             harness.close()
 
@@ -423,6 +551,8 @@ class DeepSeekHarnessBackend(ChatBackend):
         self._closed = True
         await asyncio.to_thread(self._close_runtime_sync)
         await asyncio.to_thread(self._executor.shutdown, True, cancel_futures=True)
+        if self._broker is not None:
+            await asyncio.to_thread(self._broker.close)
 
 
 def _harness_error_detail(result: Any) -> tuple[str, str | None]:
@@ -782,7 +912,7 @@ def _existing_file(value: Any) -> Path | None:
     return path if path.is_file() else None
 
 
-def _create_harness(settings: Settings) -> HarnessLike:
+def _create_harness(settings: Settings, *, delivery_env: dict[str, str] | None = None) -> HarnessLike:
     try:
         from deepseek_harness import DeepSeekHarness, DeepSeekHarnessConfig
     except ImportError as exc:
@@ -810,6 +940,7 @@ def _create_harness(settings: Settings) -> HarnessLike:
         "DSH_DESKTOP_ENABLED": "true" if settings.desktop_tools_enabled else "false",
         "DSH_DESKTOP_TOOL_TIMEOUT_MS": str(int(desktop_tool_timeout_seconds * 1000)),
     }
+    runtime_env.update(delivery_env or {})
     if settings.desktop_tools_enabled:
         runtime_env.update(
             {

@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 from pathlib import Path
 
 from ..domain import AgentReply, IncomingMessage
-from ..file_requests import DesktopFileRequestResolver
 from .deepseek_harness import DeepSeekHarnessBackend
 
 
@@ -31,7 +29,6 @@ class UnifiedAgentBackend:
         desktop_directory: Path | None = None,
     ) -> None:
         self._harness = harness_backend
-        self._desktop_files = DesktopFileRequestResolver(desktop_directory)
 
     async def handle_control(self, message: IncomingMessage) -> str | None:
         """Handle lifecycle commands before normal per-conversation serialization."""
@@ -50,7 +47,7 @@ class UnifiedAgentBackend:
                 return "当前没有正在执行的 Agent 任务。"
             return (
                 "当前任务已停止，未完成会话已保留为记录。"
-                f"下一条消息将使用全新会话 g{status.generation:04d}。"
+                f"执行器将使用 g{status.generation:04d}，已确认的对话事实仍保留；end 才清空当前上下文。"
             )
         if command in self._STATUS_COMMANDS:
             status = self._harness.session_status(message.session_id)
@@ -71,19 +68,7 @@ class UnifiedAgentBackend:
                 or policy.get("can_send_files") is False
             ):
                 return "当前账号没有读取并发送本地文件的权限。"
-            return _direct_file_reply(direct_file)
-
-        desktop_file = (
-            self._desktop_files.resolve(content)
-            if not policy
-            or (
-                policy.get("can_read_files") is not False
-                and policy.get("can_send_files") is not False
-            )
-            else None
-        )
-        if desktop_file is not None:
-            return desktop_file
+            content = f"请核实并发送这个本地文件给当前用户：{direct_file}"
 
         forced_computer = _strip_prefix(content, "/电脑")
         if forced_computer is not None:
@@ -120,6 +105,19 @@ class UnifiedAgentBackend:
                     + content
                 )
         return await self._harness.reply(replace(message, content=content))
+
+    def record_delivery(self, message: IncomingMessage, outcome: dict[str, object]) -> None:
+        self._harness.record_delivery(message, outcome)
+
+    def bind_delivery(self, message: IncomingMessage, handler):
+        return self._harness.bind_delivery(message, handler)
+
+    def progress(self, chat_session_id: str) -> str:
+        return self._harness.progress(chat_session_id)
+
+    @property
+    def delivery_store(self):
+        return self._harness.delivery_store
 
     async def abort_session(self, chat_session_id: str) -> None:
         """Stop and rotate work whose WeCom response stream is no longer usable."""
@@ -163,16 +161,3 @@ def _strip_prefix(content: str, prefix: str) -> str | None:
     if boundary not in {" ", "：", ":"}:
         return None
     return content[len(prefix) :].lstrip(" ：:")
-
-
-def _direct_file_reply(raw_path: str) -> str | AgentReply:
-    if not raw_path:
-        return "请在 /文件 后填写要发送文件的绝对路径。"
-    expanded = os.path.expandvars(raw_path.strip().strip('"'))
-    try:
-        path = Path(expanded).expanduser().resolve(strict=True)
-    except (OSError, RuntimeError):
-        return f"找不到这个文件：{expanded}"
-    if not path.is_file():
-        return "这个路径不是文件；如果要发送目录，请先让 Agent 把目录压缩成文件。"
-    return AgentReply(f"已找到文件，准备发送：{path.name}", (path,))

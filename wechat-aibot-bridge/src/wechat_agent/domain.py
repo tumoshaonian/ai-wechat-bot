@@ -2,10 +2,15 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 from typing import Literal, Mapping
 
 
 ChatType = Literal["single", "group"]
+
+
+def conversation_key(connection_id: str, chat_type: str, chat_id: str) -> str:
+    return f"wecom:{quote(connection_id, safe='')}:{chat_type}:{quote(chat_id, safe='')}"
 
 
 class AgentTaskInterrupted(RuntimeError):
@@ -27,6 +32,7 @@ class AgentReply:
 
     text: str
     files: tuple[Path, ...] = ()
+    status: str = "succeeded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +53,7 @@ class IncomingMessage:
     def session_id(self) -> str:
         """Return the stable backend conversation identifier."""
 
-        return f"wecom:{self.chat_type}:{self.chat_id}"
+        return conversation_key(self.connection_id, self.chat_type, self.chat_id)
 
     @property
     def is_group(self) -> bool:

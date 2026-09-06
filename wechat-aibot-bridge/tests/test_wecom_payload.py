@@ -20,7 +20,7 @@ class WeComPayloadTests(unittest.TestCase):
 
         self.assertEqual("owner", parsed.chat_id)
         self.assertEqual("hello", parsed.content)
-        self.assertEqual("wecom:single:owner", parsed.session_id)
+        self.assertEqual("wecom:default:single:owner", parsed.session_id)
 
     def test_parses_group_chat(self) -> None:
         parsed = parse_text_message(
@@ -36,7 +36,7 @@ class WeComPayloadTests(unittest.TestCase):
         )
 
         self.assertTrue(parsed.is_group)
-        self.assertEqual("wecom:group:room-1", parsed.session_id)
+        self.assertEqual("wecom:default:group:room-1", parsed.session_id)
 
     def test_rejects_missing_content(self) -> None:
         with self.assertRaises(InvalidWeComPayload):

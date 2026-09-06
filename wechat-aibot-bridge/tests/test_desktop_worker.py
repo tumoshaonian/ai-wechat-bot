@@ -40,6 +40,9 @@ class FakeWorker:
     def inspect_window(self, arguments):
         return self._call("inspect_window", arguments)
 
+    def prepare_window(self, arguments):
+        return self._call("prepare_window", arguments)
+
     def set_value(self, arguments):
         return self._call("set_value", arguments)
 
@@ -193,6 +196,8 @@ class DesktopWorkerTests(unittest.TestCase):
 
         names = {tool["name"] for tool in response["result"]["tools"]}  # type: ignore[index]
         self.assertEqual({
+            "prepare_window",
+            "deliver_file",
             "list_windows",
             "inspect_window",
             "set_value",

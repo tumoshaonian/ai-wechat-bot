@@ -234,7 +234,7 @@ class DeepSeekHarnessBackendTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(harness.calls[0][1], harness.calls[1][1])
             self.assertRegex(
                 harness.calls[0][1],
-                r"^wecom-[0-9a-f]{24}-g0001$",
+                r"^wecom-[0-9a-f]{24}-r[0-9a-f]{32}-g0001$",
             )
             self.assertTrue(harness.closed)
 
@@ -581,7 +581,7 @@ class DeepSeekHarnessBackendTests(unittest.IsolatedAsyncioTestCase):
             await backend.close()
 
             self.assertEqual("豆包已回答，截图准备完成。", reply.text)
-            self.assertEqual((screenshot.resolve(),), reply.files)
+            self.assertEqual((), reply.files)  # Unselected evidence is not a delivery.
 
     async def test_backend_merges_descendant_tool_screenshot_from_notifications(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -618,7 +618,7 @@ class DeepSeekHarnessBackendTests(unittest.IsolatedAsyncioTestCase):
             await backend.close()
 
             self.assertEqual("子 Agent 已完成豆包任务。", reply.text)
-            self.assertEqual((screenshot.resolve(),), reply.files)
+            self.assertEqual((), reply.files)  # Child captures are not automatically sent.
 
 
 def _desktop_tool_events(

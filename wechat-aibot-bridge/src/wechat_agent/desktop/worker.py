@@ -177,6 +177,11 @@ class DesktopWorker:
             timeout_seconds=min(self._timeout_seconds, 30),
         )
 
+    def prepare_window(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        if not str(arguments.get("process_name", "")).strip():
+            raise DesktopWorkerError("process_name is required for window recovery")
+        return self.execute("prepare_window", arguments, timeout_seconds=min(self._timeout_seconds, 20))
+
     def set_value(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         return self.execute(
             "set_value",

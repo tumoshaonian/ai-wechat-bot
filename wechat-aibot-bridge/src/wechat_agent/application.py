@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from .domain import AgentReply, AgentTaskInterrupted, IncomingMessage, UserVisibleError
 from .ports import ChatBackend, ConversationResponder
+from .file_delivery import FileDeliverySession
 from .telemetry import (
     NULL_EVENT_RECORDER,
     EventRecorder,
@@ -193,7 +194,7 @@ class MessageProcessor:
     ) -> None:
         """Process one message and finish exactly one response stream."""
 
-        if not self._recent_ids.mark_if_new(message.message_id):
+        if not self._recent_ids.mark_if_new(f"{message.connection_id}:{message.message_id}" if message.message_id else ""):
             LOGGER.info("Ignored duplicate message_id=%s", message.message_id)
             safe_record(
                 self._event_recorder,
@@ -337,8 +338,14 @@ class MessageProcessor:
                     severity="ERROR",
                 )
                 return
+            delivery = FileDeliverySession(message, responder, getattr(self._backend, "delivery_store", None))
+            bind = getattr(self._backend, "bind_delivery", None)
+            unbind = bind(message, delivery.send) if callable(bind) else lambda: None
             try:
-                raw_reply = await self._reply_with_progress(message, responder)
+                try:
+                    raw_reply = await self._reply_with_progress(message, responder)
+                finally:
+                    unbind()
                 reply = raw_reply if isinstance(raw_reply, AgentReply) else AgentReply(raw_reply)
                 text = reply.text.strip()
                 if not text and not reply.files:
@@ -395,12 +402,12 @@ class MessageProcessor:
                 )
                 await responder.send("任务处理失败，请查看电脑端日志后重试。", finish=True)
                 return
-            delivered: list[str] = []
-            failed: list[str] = []
+            delivered = delivery.names(sent=True)
+            failed = delivery.names(sent=False)
             if reply.files:
                 try:
                     await responder.send(
-                        f"任务已完成，正在发送 {len(reply.files)} 个文件…",
+                        f"已选中 {len(reply.files)} 个成果，正在发送…",
                         finish=False,
                     )
                 except Exception:
@@ -408,6 +415,11 @@ class MessageProcessor:
                         "File-delivery notice failed for message_id=%s",
                         message.message_id,
                     )
+                    self._record_delivery(message, {
+                        "sent_files": delivered,
+                        "not_attempted_files": [p.name for p in reply.files],
+                        "reason": "发送提示失败，未尝试剩余文件交付。",
+                    })
                     self._record_task(
                         message,
                         "task.failed",
@@ -421,7 +433,11 @@ class MessageProcessor:
                     return
                 for path in reply.files:
                     try:
-                        await responder.send_file(path)
+                        if message.access_policy.get("can_send_files") is False or message.access_policy.get("can_read_files") is False:
+                            raise PermissionError("当前账号没有读取并发送本地文件的权限")
+                        receipt = await delivery.send(path)
+                        if not receipt["ok"]:
+                            raise RuntimeError(receipt.get("error", "交付未确认"))
                     except Exception:
                         failed.append(path.name)
                         LOGGER.exception(
@@ -430,13 +446,19 @@ class MessageProcessor:
                             path,
                         )
                     else:
-                        delivered.append(path.name)
+                        if path.name not in delivered:
+                            delivered.append(path.name)
 
+            # Persist actual channel outcomes before attempting the final text.
+            self._record_delivery(message, {
+                "sent_files": delivered, "failed_or_unknown_files": failed,
+                "meaning": "sent 表示发送接口已确认，不代表用户已读；异常可能是回执丢失，禁止盲目重发。",
+            })
             summary = text
             if delivered:
                 summary = _append_line(summary, f"已发送文件：{', '.join(delivered)}")
             if failed:
-                summary = _append_line(summary, f"文件发送失败：{', '.join(failed)}，请查看电脑端日志。")
+                summary = "本次交付未全部确认，任务未全部完成。\n" + _append_line(summary, f"文件发送失败或结果未知：{', '.join(failed)}，请查看电脑端日志。")
             try:
                 await responder.send(summary or "文件已发送。", finish=True)
             except Exception:
@@ -461,13 +483,18 @@ class MessageProcessor:
                 message,
                 "task.completed",
                 {
-                    "state": "partial_succeeded" if failed else "succeeded",
+                    "state": "partial_succeeded" if failed else reply.status,
                     "result": text,
                     "delivered_files": delivered,
                     "failed_files": failed,
                 },
                 severity="WARNING" if failed else "INFO",
             )
+
+    def _record_delivery(self, message: IncomingMessage, outcome: dict[str, object]) -> None:
+        record = getattr(self._backend, "record_delivery", None)
+        if callable(record):
+            record(message, outcome)
 
     async def _reply_with_progress(
         self,
@@ -495,9 +522,11 @@ class MessageProcessor:
                 if done:
                     break
                 elapsed = max(1, round(time.monotonic() - started_at))
+                progress = getattr(self._backend, "progress", None)
+                detail = progress(message.session_id) if callable(progress) else "仍在处理"
                 try:
                     await responder.send(
-                        f"仍在处理，已用时约 {elapsed} 秒…",
+                        f"{detail}，已用时约 {elapsed} 秒…",
                         finish=False,
                     )
                     self._record_task(

@@ -7,6 +7,13 @@
   config:
     persona: !!js process.env.DSH_SYSTEM_PROMPT ?? 'You are a WeCom computer agent.'
 
+# Native compaction acts on live Harness history, not the channel audit journal.
+- id: compaction-basic
+  config:
+    auto: true
+    thresholdRatio: 0.75
+    retainRatio: 0.16
+
 # Python Session.run returns when the root Agent becomes idle. Keep delegated
 # work foreground/one-shot so a WeCom reply cannot finish while a continuable
 # child is still operating the computer in the background.
@@ -27,6 +34,8 @@
         args: ['-m', 'wechat_agent.desktop.mcp_server']
         cwd: !!js process.env.DSH_DESKTOP_PROJECT_ROOT ?? process.cwd()
         env:
+          DSH_DELIVERY_URL: !!js process.env.DSH_DELIVERY_URL ?? ''
+          DSH_DELIVERY_TOKEN: !!js process.env.DSH_DELIVERY_TOKEN ?? ''
           PYTHONUTF8: '1'
           PYTHONUNBUFFERED: '1'
           DSH_DESKTOP_POWERSHELL: !!js process.env.DSH_DESKTOP_POWERSHELL

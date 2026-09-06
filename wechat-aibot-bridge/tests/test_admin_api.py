@@ -142,7 +142,7 @@ class AdminApiTests(unittest.TestCase):
         )
         self.assertEqual(202, response.status_code, response.text)
         command = self.store.get_control_command(response.json()["id"])
-        self.assertEqual("wecom:single:owner", command["payload"]["session_id"])
+        self.assertEqual("wecom:default:single:owner", command["payload"]["session_id"])
 
     def test_retry_is_explicitly_unsupported_instead_of_fake_success(self) -> None:
         login = self.bootstrap_and_login()

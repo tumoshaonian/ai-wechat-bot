@@ -13,6 +13,7 @@ $OutputEncoding = $utf8
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -26,6 +27,8 @@ public sealed class NativeTopLevelWindowInfo {
     public int ProcessId { get; set; }
     public string Title { get; set; }
     public bool Visible { get; set; }
+    public bool Minimized { get; set; }
+    public long Owner { get; set; }
     public int X { get; set; }
     public int Y { get; set; }
     public int Width { get; set; }
@@ -61,17 +64,38 @@ public static class NativeTopLevelWindowEnumerator {
     private static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")]
     private static extern bool ShowWindowAsync(IntPtr hWnd, int command);
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetWindow(IntPtr hWnd, uint command);
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+    public static bool Restore(long handle, int expectedPid) {
+        var hwnd = new IntPtr(handle);
+        uint actualPid;
+        GetWindowThreadProcessId(hwnd, out actualPid);
+        if (actualPid != expectedPid) return false;
+        ShowWindowAsync(hwnd, 9);
+        return true;
+    }
+
+    public static bool MoveVisible(long handle, int expectedPid, int x, int y, int width, int height) {
+        var hwnd = new IntPtr(handle);
+        uint actualPid;
+        GetWindowThreadProcessId(hwnd, out actualPid);
+        if (actualPid != expectedPid) return false;
+        return SetWindowPos(hwnd, IntPtr.Zero, x, y, width, height, 0x0014); // no z-order or activation
+    }
 
     public static NativeTopLevelWindowInfo[] Enumerate() {
         var result = new List<NativeTopLevelWindowInfo>();
         EnumWindows(delegate(IntPtr handle, IntPtr _) {
-            if (!IsWindowVisible(handle)) return true;
             uint processId;
             GetWindowThreadProcessId(handle, out processId);
             if (processId == 0) return true;
             var length = Math.Max(0, GetWindowTextLength(handle));
             var title = new StringBuilder(length + 1);
             GetWindowText(handle, title, title.Capacity);
+            if (!IsWindowVisible(handle) && title.Length == 0) return true;
             RECT rect;
             if (!GetWindowRect(handle, out rect)) return true;
             var width = rect.Right - rect.Left;
@@ -81,7 +105,9 @@ public static class NativeTopLevelWindowEnumerator {
                 Handle = handle.ToInt64(),
                 ProcessId = (int)processId,
                 Title = title.ToString(),
-                Visible = true,
+                Visible = IsWindowVisible(handle),
+                Minimized = IsIconic(handle),
+                Owner = GetWindow(handle, 4u).ToInt64(),
                 X = rect.Left,
                 Y = rect.Top,
                 Width = width,
@@ -284,6 +310,8 @@ function Get-NativeWindowDescriptor {
         class_name = ''
         enabled = $true
         offscreen = -not $window.Visible
+        minimized = $window.Minimized
+        owner_handle = $window.Owner
         bounds = [ordered]@{
             x = $window.X
             y = $window.Y
@@ -314,6 +342,48 @@ function Get-MatchingWindows {
         } catch {}
     }
     return @($matches | ForEach-Object { $_ })
+}
+
+function Prepare-TargetWindow {
+    param([string]$ProcessName, [string]$TitleContains = '', [double]$TimeoutSeconds = 10)
+    if (-not $ProcessName) { throw 'WINDOW_TARGET_REQUIRED: process_name is required for window recovery' }
+    $candidates = @(Get-MatchingNativeWindows -ProcessName $ProcessName -TitleContains $TitleContains |
+        Where-Object { $_.Native.Owner -eq 0 -and $_.Native.Title -and
+            ($_.Native.Minimized -or ($_.Native.Width -ge 300 -and $_.Native.Height -ge 200)) })
+    if ($candidates.Count -eq 0) { throw 'MAIN_WINDOW_NOT_FOUND: no main-window candidate; helper windows were excluded' }
+    if ($candidates.Count -gt 1) { throw 'WINDOW_AMBIGUOUS: multiple main windows; provide a more specific title_contains' }
+    $candidate = $candidates[0]
+    $native = $candidate.Native
+    $script:Stage = 'restore-target-window'
+    if (-not [NativeTopLevelWindowEnumerator]::Restore($native.Handle, $native.ProcessId)) {
+        throw 'WINDOW_IDENTITY_CHANGED: original window no longer belongs to the target process'
+    }
+    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        Assert-WorkerAlive
+        $current = @([NativeTopLevelWindowEnumerator]::Enumerate() |
+            Where-Object { $_.Handle -eq $native.Handle -and $_.ProcessId -eq $native.ProcessId })
+        if ($current.Count -eq 1 -and -not $current[0].Minimized) {
+            $rect = New-Object System.Drawing.Rectangle($current[0].X, $current[0].Y, $current[0].Width, $current[0].Height)
+            $onScreen = @([System.Windows.Forms.Screen]::AllScreens | Where-Object {
+                $intersection = [System.Drawing.Rectangle]::Intersect($_.WorkingArea, $rect)
+                $intersection.Width -ge 300 -and $intersection.Height -ge 200
+            })
+            if ($onScreen.Count -eq 0) {
+                $area = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+                $width = [math]::Min($area.Width, [math]::Max(600, $rect.Width))
+                $height = [math]::Min($area.Height, [math]::Max(400, $rect.Height))
+                if (-not [NativeTopLevelWindowEnumerator]::MoveVisible($native.Handle, $native.ProcessId, $area.X, $area.Y, $width, $height)) {
+                    throw 'WINDOW_RESTORE_FAILED: could not move verified window into visible display bounds'
+                }
+            } else {
+                $element = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]([long]$native.Handle))
+                if ($element -and -not $element.Current.IsOffscreen -and $element.Current.IsEnabled) { return $element }
+            }
+        }
+        Start-Sleep -Milliseconds 200
+    } while ([datetime]::UtcNow -lt $deadline)
+    throw 'WINDOW_RESTORE_FAILED: target did not become visible and interactive before deadline'
 }
 
 function Wait-Window {
@@ -767,6 +837,10 @@ try {
     $titleContains = [string](Get-Field -Object $payload -Name 'title_contains' -Default '')
 
     switch ($Action) {
+        'prepare_window' {
+            $window = Prepare-TargetWindow -ProcessName $processName -TitleContains $titleContains
+            $result = [ordered]@{ ok = $true; stage = 'window-ready'; window = (Get-ElementDescriptor -Element $window) }
+        }
         'list_windows' {
             $script:Stage = 'list-windows'
             $windows = @(Get-MatchingNativeWindows -ProcessName $processName -TitleContains $titleContains)
@@ -853,14 +927,19 @@ try {
             $launchPath = [string](Get-Field -Object $payload -Name 'launch_path' -Default '')
             $accessibilityRestarted = $false
             $script:Stage = 'locate-doubao-window'
-            $existing = @(Get-MatchingWindows -ProcessName $processName -InteractiveOnly)
+            $existing = @(Get-MatchingNativeWindows -ProcessName $processName | Where-Object {
+                $_.Native.Owner -eq 0 -and $_.Native.Title -and
+                ($_.Native.Minimized -or ($_.Native.Width -ge 300 -and $_.Native.Height -ge 200))
+            })
             if ($existing.Count -eq 0) {
                 if (-not $launchPath) {
                     throw 'Doubao has no interactive window and DSH_DOUBAO_LAUNCH_PATH is not configured'
                 }
                 $script:Stage = 'launch-doubao-accessible'
                 Start-DoubaoAccessible -LaunchPath $launchPath
+                $null = Wait-Window -ProcessName $processName -TitleContains '' -TimeoutSeconds $windowTimeout -MinimumWidth 400 -MinimumHeight 300
             }
+            $null = Prepare-TargetWindow -ProcessName $processName -TimeoutSeconds ([math]::Min(10, $windowTimeout))
             $window = Wait-Window `
                 -ProcessName $processName `
                 -TitleContains '' `
@@ -876,14 +955,7 @@ try {
                 # accessibility tree disabled.  Restart only this verified
                 # Doubao process with Chromium's supported accessibility flag.
                 $script:Stage = 'restart-doubao-accessible'
-                $window = Restart-DoubaoAccessible `
-                    -Window $window `
-                    -LaunchPath $launchPath `
-                    -ProcessName $processName `
-                    -TimeoutSeconds $windowTimeout
-                $accessibilityRestarted = $true
-                $script:Stage = 'wait-doubao-accessibility-tree'
-                $input = Wait-DoubaoInput -Window $window -TimeoutSeconds $windowTimeout
+                throw 'CONTROL_UNAVAILABLE: target window is visible but no writable UIA input was found. No process was killed or restarted; accessibility restart needs user approval.'
             }
 
             $script:Stage = 'set-and-verify-question'

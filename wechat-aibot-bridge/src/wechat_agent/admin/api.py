@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import AdminSettings
+from ..domain import conversation_key
 from .connection_probe import (
     ConnectionProbe,
     ConnectionProbeResult,
@@ -315,7 +316,7 @@ def create_app(
         key = idempotency_key or f"end:{conversation_id}:{principal['user']['id']}"
         payload = body.model_dump()
         payload.update(
-            session_id=f"wecom:{conversation['chat_type']}:{conversation['external_chat_id']}",
+            session_id=conversation_key(conversation['connection_id'], conversation['chat_type'], conversation['external_chat_id']),
             external_chat_id=conversation["external_chat_id"],
             chat_type=conversation["chat_type"],
         )

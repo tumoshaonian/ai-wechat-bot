@@ -124,17 +124,18 @@ class MessageProcessorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(("余额不足", True), responder.updates[-1])
 
     async def test_delivers_agent_files_before_finishing_stream(self) -> None:
-        attachment = Path("D:/report.docx")
-        backend = FakeBackend(reply=AgentReply("文档已找到。", (attachment,)))
-        responder = FakeResponder()
-        processor = MessageProcessor(backend)
-
-        await processor.handle(message(), responder)
-
-        self.assertEqual([attachment], responder.files)
-        self.assertEqual(False, responder.updates[-2][1])
-        self.assertEqual(True, responder.updates[-1][1])
-        self.assertIn("已发送文件：report.docx", responder.updates[-1][0])
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as root:
+            attachment = Path(root) / "report.docx"
+            attachment.write_bytes(b"test document")
+            backend = FakeBackend(reply=AgentReply("文档已找到。", (attachment,)))
+            responder = FakeResponder()
+            processor = MessageProcessor(backend)
+            await processor.handle(message(), responder)
+            self.assertEqual([attachment], responder.files)
+            self.assertEqual(False, responder.updates[-2][1])
+            self.assertEqual(True, responder.updates[-1][1])
+            self.assertIn("已发送文件：report.docx", responder.updates[-1][0])
 
     async def test_control_command_bypasses_busy_conversation_lock(self) -> None:
         class ControllableBackend(FakeBackend):

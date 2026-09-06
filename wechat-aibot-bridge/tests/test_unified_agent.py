@@ -70,15 +70,23 @@ class UnifiedAgentBackendTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("不得调用任何工具", self.harness.messages[0].content)
 
-    async def test_direct_file_command_bypasses_harness(self) -> None:
+    async def test_legacy_file_command_also_uses_harness(self) -> None:
         with TemporaryDirectory() as temporary:
             path = Path(temporary) / "report.docx"
             path.write_bytes(b"document")
 
             reply = await self.agent.reply(message(f'/文件 "{path}"'))
 
-            self.assertEqual(AgentReply("已找到文件，准备发送：report.docx", (path.resolve(),)), reply)
-            self.assertEqual([], self.harness.messages)
+            self.assertIn(str(path), self.harness.messages[0].content)
+            self.assertIsInstance(reply, str)
+
+    async def test_compound_and_simple_file_requests_are_not_intercepted(self) -> None:
+        for content in (
+            "请你打开电脑豆包，然后让豆包帮我在桌面创建一个文档，并且在里面写一个200字的故事，然后你把这个豆包生成的文档发给我",
+            "给我发送电脑桌面的LeapMind暑假开发计划文档",
+        ):
+            await self.agent.reply(message(content))
+            self.assertEqual(content, self.harness.messages[-1].content)
 
     async def test_user_policy_blocks_direct_file_and_computer_operations(self) -> None:
         denied = {
