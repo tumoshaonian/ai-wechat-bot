@@ -84,6 +84,7 @@ class UnifiedAgentBackendTests(unittest.IsolatedAsyncioTestCase):
         for content in (
             "请你打开电脑豆包，然后让豆包帮我在桌面创建一个文档，并且在里面写一个200字的故事，然后你把这个豆包生成的文档发给我",
             "给我发送电脑桌面的LeapMind暑假开发计划文档",
+            "在未预置的科研应用星图中导出实验报告，然后把报告发送给我",
         ):
             await self.agent.reply(message(content))
             self.assertEqual(content, self.harness.messages[-1].content)

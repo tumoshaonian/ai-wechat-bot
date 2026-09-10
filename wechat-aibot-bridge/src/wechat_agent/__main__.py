@@ -90,7 +90,7 @@ async def serve(settings: Settings) -> None:
     )
     control_worker = AdminControlWorker(
         event_recorder,
-        backend,
+        processor,
         file_sender=channel,
     )
     await control_worker.start()

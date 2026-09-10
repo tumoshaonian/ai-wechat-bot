@@ -29,11 +29,24 @@ class UnifiedAgentBackend:
         desktop_directory: Path | None = None,
     ) -> None:
         self._harness = harness_backend
+        self._task_controller = None
+
+    def bind_task_controller(self, controller) -> None:
+        self._task_controller = controller
 
     async def handle_control(self, message: IncomingMessage) -> str | None:
         """Handle lifecycle commands before normal per-conversation serialization."""
 
         command = _normalized_command(message.content)
+        if self._task_controller is not None and command in self._END_COMMANDS:
+            result = await self._task_controller.end_chat_session(message.session_id)
+            return (
+                f"当前 Agent 会话已结束，已停止 {result['cancelled_tasks']} 个活动或排队任务；历史记录保留。"
+                "下一条消息使用新会话，不继承之前的记忆或排队请求。"
+            )
+        if self._task_controller is not None and command in self._STOP_COMMANDS:
+            result = await self._task_controller.stop_chat_session(message.session_id)
+            return f"已停止当前会话 {result['cancelled_tasks']} 个活动或排队任务，历史事实保留；已发生的操作不回滚。"
         if command in self._END_COMMANDS:
             interrupted, status = await self._harness.end_session(message.session_id)
             prefix = "当前任务已停止；" if interrupted else ""

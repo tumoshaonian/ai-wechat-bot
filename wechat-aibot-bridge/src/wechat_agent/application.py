@@ -7,7 +7,7 @@ import hashlib
 import logging
 import time
 from collections import deque
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -167,6 +167,14 @@ class _ObservedResponder:
         )
 
 
+@dataclass
+class _ManagedTask:
+    message: IncomingMessage
+    work: asyncio.Task
+    settled: asyncio.Event
+    stopping: bool = False
+
+
 class MessageProcessor:
     """Authorize, serialize, execute, and report one inbound message."""
 
@@ -186,6 +194,12 @@ class MessageProcessor:
         self._progress_interval_seconds = max(0.01, progress_interval_seconds)
         self._task_timeout_seconds = max(0.02, task_timeout_seconds)
         self._event_recorder = event_recorder
+        self._tasks: dict[str, _ManagedTask] = {}
+        self._ending_sessions: set[str] = set()
+        self._closed = False
+        bind_control = getattr(backend, "bind_task_controller", None)
+        if callable(bind_control):
+            bind_control(self)
 
     async def handle(
         self,
@@ -318,6 +332,41 @@ class MessageProcessor:
                 )
                 return
 
+        if self._closed or message.session_id in self._ending_sessions:
+            self._record_task(message, "task.cancelled", {"state": "cancelled", "reason": "session_closing"})
+            await responder.send("当前会话正在结束或服务正在关闭，本条请求未执行，请稍后重新发送。", finish=True)
+            return
+        if message.task_id in self._tasks:
+            raise RuntimeError("duplicate active task identity")
+        entry = _ManagedTask(message, asyncio.create_task(self._handle_task(message, responder)), asyncio.Event())
+        self._tasks[message.task_id] = entry
+        try:
+            await asyncio.shield(entry.work)
+        except asyncio.CancelledError:
+            if not entry.stopping:
+                entry.stopping = True
+                entry.work.cancel()
+            # Do not declare cancelled while an owned executor is still draining.
+            draining = asyncio.gather(entry.work, return_exceptions=True)
+            while not draining.done():
+                try:
+                    await asyncio.shield(draining)
+                except asyncio.CancelledError:
+                    # Repeated caller cancellation must not release ownership early.
+                    continue
+            self._record_task(message, "task.cancelled", {
+                "state": "cancelled", "reason": "processor_cancelled",
+                "effects": "尚未执行的步骤已取消；已发生的操作不回滚，交付回执未知时不可盲目重试。",
+            })
+            try:
+                await asyncio.wait_for(responder.send("当前任务已停止；已发生的操作不回滚，未确认的交付请先核实。", finish=True), 3)
+            except Exception:
+                LOGGER.warning("Could not deliver cancellation acknowledgement task_id=%s", message.task_id)
+        finally:
+            self._tasks.pop(message.task_id, None)
+            entry.settled.set()
+
+    async def _handle_task(self, message: IncomingMessage, responder: ConversationResponder) -> None:
         lock = self._conversation_locks.setdefault(message.session_id, asyncio.Lock())
         async with lock:
             self._record_task(message, "task.started", {"state": "running"})
@@ -577,8 +626,53 @@ class MessageProcessor:
 
     async def close(self) -> None:
         """Release the configured backend."""
-
+        if self._closed:
+            return
+        self._closed = True
+        entries = list(self._tasks.values())
+        self._request_stops(entries)
+        await asyncio.gather(*(entry.settled.wait() for entry in entries))
         await self._backend.close()
+
+    @staticmethod
+    def _request_stops(entries: list[_ManagedTask]) -> int:
+        count = 0
+        for entry in entries:
+            if not entry.work.done():
+                count += 1
+                if not entry.stopping:
+                    entry.stopping = True
+                    entry.work.cancel()
+        return count
+
+    async def cancel_task(self, task_id: str) -> dict[str, object]:
+        """Cancel by identity, including waits outside the Harness runtime."""
+        entry = self._tasks.get(task_id)
+        if entry is None or entry.work.done():
+            return {"interrupted": False, "state": "not_running"}
+        self._request_stops([entry])
+        await entry.settled.wait()
+        return {"interrupted": True, "state": "cancelled", "task_id": task_id}
+
+    async def stop_chat_session(self, session_id: str) -> dict[str, object]:
+        entries = [entry for entry in self._tasks.values() if entry.message.session_id == session_id]
+        count = self._request_stops(entries)
+        await asyncio.gather(*(entry.settled.wait() for entry in entries))
+        return {"interrupted": bool(count), "cancelled_tasks": count, "state": "stopped"}
+
+    async def end_chat_session(self, session_id: str) -> dict[str, object]:
+        if session_id in self._ending_sessions:
+            raise RuntimeError("Session termination is already in progress")
+        self._ending_sessions.add(session_id)
+        try:
+            stopped = await self.stop_chat_session(session_id)
+            end = getattr(self._backend, "end_chat_session", None)
+            if not callable(end):
+                raise RuntimeError("The backend cannot end sessions")
+            result = await end(session_id)
+            return dict(result) | {"interrupted": stopped["interrupted"], "cancelled_tasks": stopped["cancelled_tasks"]}
+        finally:
+            self._ending_sessions.discard(session_id)
 
     def _record_task(
         self,

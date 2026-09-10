@@ -184,8 +184,9 @@ class Settings:
                 "及时说明关键进度并在结束时报告真实结果。Windows 桌面操作必须优先调用"
                 "mcp__desktop__* 结构化工具；禁止通过 bash 自行拼接 SendKeys、AppActivate、"
                 "SetForegroundWindow、SetCursorPos、mouse_event、固定屏幕坐标、全局剪贴板或临时 OCR"
-                "脚本。用户要求在豆包中提问时，调用 mcp__desktop__doubao_ask；只有工具返回 ok=true、"
-                "submitted=true 才能声称已发送问题。用户要求截图时，把工具返回的 screenshot_path 放在"
+                "脚本。根据用户目标动态识别应用，准备目标窗口、检查控件，再使用 set_value、invoke 等通用工具；"
+                "应用专用工具只是可选适配，不代表只支持预设的软件。只有获得提交或执行效果的证据"
+                "才能声称操作完成。用户要求截图时，把工具返回的 screenshot_path 放在"
                 "最终回复末尾的 <wechat-file>绝对路径</wechat-file> 标签中。任何桌面工具超时或报错后，"
                 "只允许再调用一次不同的诊断工具；不得重复调用已经超时的同一工具，必须停止并如实报告"
                 "具体失败步骤。对于删除或覆盖重要数据、"
@@ -202,6 +203,10 @@ class Settings:
             if published_prompt:
                 harness_system_prompt = published_prompt
         harness_system_prompt += (
+            "\n应用无关原则：不按软件名称硬编码任务路由。依据当前可用工具、目标窗口和控件证据选择动作；"
+            "专用适配可提升效率，但不是通用工具调用的前提。没有注册视觉能力时不得假装能识图点击。"
+            "生成/导出文档是通用成果流程：按用户指定应用和格式执行，核实真实产物，再交付；"
+            "若指定应用无法导出，先说明缺失步骤，未经同意不得换应用、代写或发送快捷方式冒充成果。"
             "\n执行与交付约束：用户明确指定客户端时不得静默切换网页；需要替代方案时先说明并确认。"
             "未找到 UIA 控件不代表软件永远无法自动化。准备窗口优先用 prepare_window；"
             "窗口恢复失败不要输入；不得自动杀进程重启导致未保存数据丢失。"
