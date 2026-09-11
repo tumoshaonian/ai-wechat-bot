@@ -21,6 +21,16 @@ class AdminStoreTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_waiting_confirmation_requires_explicit_resume_event(self):
+        for event in ("task.started", "task.waiting", "task.progress"):
+            self.store.record_event(event, trace_id="approval", payload={"task_id": "approval"})
+        self.assertEqual("WAITING_CONFIRMATION", self.store.task_detail("approval")["status"])
+        self.store.record_event("task.resumed", trace_id="approval", payload={"task_id": "approval"})
+        self.assertEqual("RUNNING", self.store.task_detail("approval")["status"])
+        self.store.enqueue_task_cancel("approval", "stop", "admin", None)
+        self.store.record_event("task.resumed", trace_id="approval", payload={"task_id": "approval"})
+        self.assertEqual("CANCEL_REQUESTED", self.store.task_detail("approval")["status"])
+
     def test_terminal_tasks_cannot_be_reopened_or_rewritten_by_late_events(self):
         for terminal in ("task.completed", "task.failed", "task.cancelled", "task.timeout"):
             task_id = terminal

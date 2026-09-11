@@ -57,6 +57,15 @@ def _schema(properties: dict[str, Any], required: tuple[str, ...] = ()) -> dict[
 
 TOOLS: tuple[dict[str, Any], ...] = (
     {
+        "name": "request_confirmation",
+        "description": "Before a consequential operation, ask the current task's original user to explicitly approve the exact action, target and effect. Blocks for at most 90 seconds. Only approved=true allows the described operation; reject/expire/cancel means do not execute it. This is not blanket permission for other operations.",
+        "inputSchema": _schema({"task_ticket": {"type": "string"}, "operation": _schema({
+            "action": {"type": "string", "minLength": 1, "maxLength": 200},
+            "target": {"type": "string", "minLength": 1, "maxLength": 1000},
+            "effect": {"type": "string", "minLength": 1, "maxLength": 2000},
+        }, ("action", "target", "effect"))}, ("task_ticket", "operation")),
+    },
+    {
         "name": "deliver_file",
         "description": "Send an explicitly selected existing local file to the current task's bound WeCom recipient. Use the current task_ticket supplied with the request. sent means the channel acknowledged delivery, not user read. Unknown outcomes must not be blindly retried. Do not also output a file tag for a file already delivered by this tool.",
         "inputSchema": _schema({"path": {"type": "string"}, "task_ticket": {"type": "string"}}, ("path", "task_ticket")),
@@ -171,6 +180,7 @@ def _worker_from_environment() -> DesktopWorker:
 
 def _tool_handlers(worker: DesktopWorker) -> dict[str, Any]:
     return {
+        "request_confirmation": _request_confirmation,
         "deliver_file": _deliver_file,
         "prepare_window": worker.prepare_window,
         "list_windows": worker.list_windows,
@@ -182,16 +192,26 @@ def _tool_handlers(worker: DesktopWorker) -> dict[str, Any]:
     }
 
 
+def _request_confirmation(arguments: dict[str, Any]) -> dict[str, Any]:
+    return _broker_request(arguments, confirm=True)
+
+
 def _deliver_file(arguments: dict[str, Any]) -> dict[str, Any]:
+    return _broker_request(arguments)
+
+
+def _broker_request(arguments: dict[str, Any], *, confirm=False) -> dict[str, Any]:
     url = os.environ.get("DSH_DELIVERY_URL", "")
     token = os.environ.get("DSH_DELIVERY_TOKEN", "")
     if not url.startswith("http://127.0.0.1:") or not token:
         raise DesktopWorkerError("当前运行时未连接文件交付服务")
+    if confirm:
+        url = url.rsplit("/", 1)[0] + "/confirm"
     data = json.dumps(arguments).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers={
         "Authorization": "Bearer " + token, "Content-Type": "application/json",
     })
-    with urllib.request.urlopen(request, timeout=70) as response:
+    with urllib.request.urlopen(request, timeout=110 if confirm else 70) as response:
         return json.loads(response.read(65536))
 
 

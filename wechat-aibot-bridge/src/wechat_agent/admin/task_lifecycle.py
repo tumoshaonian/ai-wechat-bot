@@ -7,6 +7,7 @@ EVENT_STATES = {
     "task.received": "RECEIVED", "task.queued": "QUEUED", "task.started": "RUNNING",
     "task.progress": "RUNNING", "task.completed": "SUCCEEDED", "task.failed": "FAILED",
     "task.cancelled": "CANCELLED", "task.timeout": "TIMED_OUT",
+    "task.waiting": "WAITING_CONFIRMATION", "task.resumed": "RUNNING",
 }
 
 
@@ -21,6 +22,8 @@ def projected_state(current: str | None, event: str, payload: dict) -> str | Non
         candidate = "PARTIAL_SUCCEEDED"
     if current == "CANCEL_REQUESTED" and candidate not in TERMINAL_STATES:
         return None  # Cancellation requested is not cancellation confirmed.
+    if current == "WAITING_CONFIRMATION" and event in {"task.started", "task.progress", "task.queued"}:
+        return None  # A heartbeat is not a decision; only task.resumed exits waiting.
     order = {"RECEIVED": 0, "QUEUED": 1, "RUNNING": 2}
     if current in order and candidate in order and order[candidate] < order[current]:
         return None

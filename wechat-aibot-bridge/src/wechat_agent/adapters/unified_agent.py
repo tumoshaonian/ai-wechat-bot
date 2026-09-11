@@ -38,6 +38,11 @@ class UnifiedAgentBackend:
         """Handle lifecycle commands before normal per-conversation serialization."""
 
         command = _normalized_command(message.content)
+        decision = command.split()
+        if decision and decision[0] in {"/确认", "/拒绝", "确认", "拒绝"}:
+            if len(decision) != 2 or len(decision[1]) != 16 or any(c not in "0123456789abcdef" for c in decision[1]):
+                return "请使用机器人提供的一次性编号：/确认 编号 或 /拒绝 编号；单独说确认不会授权操作。"
+            return self._harness.decide_confirmation(message, decision[1], decision[0] in {"/确认", "确认"})
         if self._task_controller is not None and command in self._END_COMMANDS:
             result = await self._task_controller.end_chat_session(message.session_id)
             return (
@@ -124,6 +129,12 @@ class UnifiedAgentBackend:
 
     def bind_delivery(self, message: IncomingMessage, handler):
         return self._harness.bind_delivery(message, handler)
+
+    def bind_confirmation(self, message, presenter):
+        return self._harness.bind_confirmation(message, presenter)
+
+    def waiting_confirmation(self, session_id):
+        return self._harness.waiting_confirmation(session_id)
 
     def progress(self, chat_session_id: str) -> str:
         return self._harness.progress(chat_session_id)

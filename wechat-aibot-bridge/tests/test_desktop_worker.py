@@ -196,6 +196,7 @@ class DesktopWorkerTests(unittest.TestCase):
 
         names = {tool["name"] for tool in response["result"]["tools"]}  # type: ignore[index]
         self.assertEqual({
+            "request_confirmation",
             "prepare_window",
             "deliver_file",
             "list_windows",

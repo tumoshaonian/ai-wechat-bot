@@ -391,10 +391,13 @@ class MessageProcessor:
             delivery = FileDeliverySession(message, responder, getattr(self._backend, "delivery_store", None))
             bind = getattr(self._backend, "bind_delivery", None)
             unbind = bind(message, delivery.send) if callable(bind) else lambda: None
+            confirm_bind = getattr(self._backend, "bind_confirmation", None)
+            confirm_unbind = confirm_bind(message, lambda text: responder.send(text, finish=False)) if callable(confirm_bind) else lambda: None
             try:
                 try:
                     raw_reply = await self._reply_with_progress(message, responder)
                 finally:
+                    confirm_unbind()
                     unbind()
                 reply = raw_reply if isinstance(raw_reply, AgentReply) else AgentReply(raw_reply)
                 text = reply.text.strip()
@@ -594,10 +597,11 @@ class MessageProcessor:
                         f"{detail}，已用时约 {elapsed} 秒…",
                         finish=False,
                     )
+                    waiting = getattr(self._backend, "waiting_confirmation", lambda _: False)(message.session_id)
                     self._record_task(
                         message,
-                        "task.progress",
-                        {"state": "running", "elapsed_seconds": elapsed},
+                        "task.waiting" if waiting else "task.progress",
+                        {"state": "waiting_confirmation" if waiting else "running", "elapsed_seconds": elapsed},
                     )
                 except Exception as exc:
                     LOGGER.exception(

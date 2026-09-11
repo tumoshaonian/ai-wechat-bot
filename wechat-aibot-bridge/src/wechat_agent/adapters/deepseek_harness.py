@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable, Protocol
 from ..domain import AgentReply, AgentTaskInterrupted, IncomingMessage, UserVisibleError
 from ..ports import ChatBackend
 from ..conversation_journal import ConversationJournal
+from ..confirmations import ConfirmationCoordinator
 from ..history_recovery import recover_context
 from .harness_summary import summarize_history
 from ..session_registry import HarnessConversationStatus, HarnessSessionLease, HarnessSessionRegistry
@@ -78,6 +79,8 @@ class DeepSeekHarnessBackend(ChatBackend):
         self._runtime_guard = threading.RLock()
         self._registry = HarnessSessionRegistry(settings.harness_session_root)
         self._journal = ConversationJournal(settings.harness_session_root)
+        self._confirmations = ConfirmationCoordinator(self._journal)
+        self._confirmation_presenters = {}
         self._runtime_nonce = uuid4().hex
         self._history_offsets: dict[tuple[str, int], int] = {}
         self._delivery_epochs: dict[str, int] = {}
@@ -93,7 +96,7 @@ class DeepSeekHarnessBackend(ChatBackend):
 
     def _create_with_delivery(self, settings: Settings) -> HarnessLike:
         if self._broker is None:
-            self._broker = DeliveryBroker(self._deliver_from_tool)
+            self._broker = DeliveryBroker(self._deliver_from_tool, self._confirm_from_tool)
         return _create_harness(settings, delivery_env={
             "DSH_DELIVERY_URL": self._broker.url,
             "DSH_DELIVERY_TOKEN": self._broker.token,
@@ -120,6 +123,8 @@ class DeepSeekHarnessBackend(ChatBackend):
             if entry is None or entry[0].task_id != self._active_task_id:
                 raise ValueError("expired task ticket")
             message, loop, handler = entry
+        if self._confirmations.waiting(task_id=message.task_id):
+            return {"ok": False, "status": "rejected", "error": "当前任务正在等待确认，暂不交付文件。"}
         future = asyncio.run_coroutine_threadsafe(handler(Path(path)), loop)
         # A timeout does not prove that the platform rejected the upload.
         try:
@@ -131,6 +136,52 @@ class DeepSeekHarnessBackend(ChatBackend):
         if epoch is not None:
             self._journal.append(message.session_id, epoch, "delivery", outcome)
         return outcome
+
+    def bind_confirmation(self, message, presenter):
+        self._confirmation_presenters[message.task_id] = presenter
+        def unbind():
+            self._confirmation_presenters.pop(message.task_id, None)
+            self._confirmations.cancel_task(message.task_id)
+        return unbind
+
+    def decide_confirmation(self, message, code, approve):
+        return self._confirmations.decide(message, code, approve)[1]
+
+    def waiting_confirmation(self, session_id):
+        return self._confirmations.waiting(session_id=session_id)
+
+    def _confirm_from_tool(self, ticket, operation):
+        with self._runtime_guard:
+            entry = self._deliveries.get(ticket)
+            if entry is None or entry[0].task_id != self._active_task_id:
+                raise ValueError("expired task ticket")
+            message, loop, _ = entry
+        async def request():
+            presenter = self._confirmation_presenters.get(message.task_id)
+            epoch = self._delivery_epochs.get(message.task_id or message.message_id)
+            if presenter is None or epoch is None or message.task_id != self._active_task_id:
+                raise ValueError("task no longer accepts confirmation")
+            try:
+                result = await self._confirmations.request(message, epoch, operation, presenter,
+                    lambda kind, payload: self._record_agent_event(message, kind, payload))
+            except Exception:
+                if message.task_id == self._active_task_id:
+                    self._interrupt_requested_for.add(message.session_id)
+                    self._registry.rotate(message.session_id, reason="confirmation-failed")
+                    await asyncio.to_thread(self._close_runtime_sync)
+                raise
+            if not result["approved"] and message.task_id == self._active_task_id:
+                # Denial/expiry must not return control to an executing agent.
+                self._interrupt_requested_for.add(message.session_id)
+                self._registry.rotate(message.session_id, reason="confirmation-" + result["status"])
+                await asyncio.to_thread(self._close_runtime_sync)
+            return result
+        future = asyncio.run_coroutine_threadsafe(request(), loop)
+        try:
+            return future.result(timeout=100)
+        except BaseException:
+            future.cancel()
+            raise
 
     async def start(self) -> None:
         """Fail fast before WeCom connects if the SDK profile cannot initialize."""
@@ -196,6 +247,7 @@ class DeepSeekHarnessBackend(ChatBackend):
             if ticket:
                 content += ("\n当前交付票据（仅本任务有效，不要回复给用户）：" + ticket
                             + "。发送文件请调用 mcp__desktop__deliver_file(path, task_ticket)，"
+                            "高风险操作前调用 mcp__desktop__request_confirmation(task_ticket, operation)，等待一次性确认。"
                             "接收对象已由系统绑定。依据回执汇报，已发送文件不要再输出文件标签。")
             if history:
                 content = (
@@ -299,6 +351,7 @@ class DeepSeekHarnessBackend(ChatBackend):
                 self._registry.rotate(message.session_id, reason="runtime-error")
                 raise UserVisibleError(user_message, code=error_code) from exc
             finally:
+                self._confirmations.cancel_task(message.task_id)
                 with self._runtime_guard:
                     if self._active_chat_session_id == message.session_id:
                         self._active_chat_session_id = None
@@ -481,6 +534,8 @@ class DeepSeekHarnessBackend(ChatBackend):
         )
 
     def progress(self, chat_session_id: str) -> str:
+        if self.waiting_confirmation(chat_session_id):
+            return "正在等待原请求用户确认具体操作"
         with self._runtime_guard:
             return self._progress.get(chat_session_id, "Agent 正在分析请求")
 

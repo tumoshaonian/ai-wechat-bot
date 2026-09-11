@@ -11,7 +11,7 @@ from typing import Callable
 
 
 class DeliveryBroker:
-    def __init__(self, deliver: Callable[[str, str], dict]) -> None:
+    def __init__(self, deliver: Callable[[str, str], dict], confirm=None) -> None:
         self.token = secrets.token_urlsafe(32)
         token = self.token
 
@@ -21,7 +21,7 @@ class DeliveryBroker:
 
             def do_POST(self):
                 self.connection.settimeout(10)
-                if self.path != "/deliver" or not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + token):
+                if self.path not in {"/deliver", "/confirm"} or not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + token):
                     self.send_error(403)
                     return
                 try:
@@ -29,13 +29,21 @@ class DeliveryBroker:
                     if not 0 < length <= 16384:
                         raise ValueError("invalid request size")
                     body = json.loads(self.rfile.read(length))
-                    if not isinstance(body, dict) or set(body) != {"task_ticket", "path"}:
-                        raise ValueError("expected task_ticket and path")
-                    if not all(isinstance(body[k], str) and body[k] for k in body):
-                        raise ValueError("ticket and path must be nonempty strings")
-                    result = deliver(body["task_ticket"], body["path"])
+                    field = "path" if self.path == "/deliver" else "operation"
+                    if not isinstance(body, dict) or set(body) != {"task_ticket", field}:
+                        raise ValueError("invalid request fields")
+                    if not isinstance(body["task_ticket"], str) or not body["task_ticket"]:
+                        raise ValueError("ticket must be a nonempty string")
+                    if field == "path":
+                        if not isinstance(body[field], str) or not body[field]:
+                            raise ValueError("invalid path")
+                        result = deliver(body["task_ticket"], body[field])
+                    elif confirm is not None:
+                        result = confirm(body["task_ticket"], body[field])
+                    else:
+                        raise ValueError("confirmation is unavailable")
                 except Exception:
-                    result = {"ok": False, "status": "rejected", "error": "交付请求被拒绝；检查当前任务票据、授权与文件路径。"}
+                    result = {"ok": False, "approved": False, "status": "rejected", "error": "请求被拒绝；检查当前任务票据、授权和参数。"}
                 encoded = json.dumps(result, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
