@@ -21,6 +21,7 @@ from ..domain import AgentReply, AgentTaskInterrupted, IncomingMessage, UserVisi
 from ..ports import ChatBackend
 from ..conversation_journal import ConversationJournal
 from ..confirmations import ConfirmationCoordinator
+from ..execution_policy import OBSERVATION_TOOLS, CONFIRMATION_TOOL, validate_dispatch, confirmation_operation
 from ..history_recovery import recover_context
 from .harness_summary import summarize_history
 from ..session_registry import HarnessConversationStatus, HarnessSessionLease, HarnessSessionRegistry
@@ -82,6 +83,9 @@ class DeepSeekHarnessBackend(ChatBackend):
         self._confirmations = ConfirmationCoordinator(self._journal)
         self._confirmation_presenters = {}
         self._runtime_nonce = uuid4().hex
+        self._active_policy_session = None
+        self._policy_calls = set()
+        self._policy_lock = threading.Lock()
         self._history_offsets: dict[tuple[str, int], int] = {}
         self._delivery_epochs: dict[str, int] = {}
         self._event_recorder = event_recorder
@@ -96,11 +100,57 @@ class DeepSeekHarnessBackend(ChatBackend):
 
     def _create_with_delivery(self, settings: Settings) -> HarnessLike:
         if self._broker is None:
-            self._broker = DeliveryBroker(self._deliver_from_tool, self._confirm_from_tool)
+            self._broker = DeliveryBroker(self._deliver_from_tool, self._confirm_from_tool, self._authorize_dispatch)
         return _create_harness(settings, delivery_env={
             "DSH_DELIVERY_URL": self._broker.url,
             "DSH_DELIVERY_TOKEN": self._broker.token,
+            "DSH_EXECUTION_POLICY_URL": self._broker.url.rsplit("/", 1)[0] + "/authorize",
+            "DSH_EXECUTION_POLICY_NONCE": self._runtime_nonce,
         })
+
+    def _authorize_dispatch(self, body):
+        digest = validate_dispatch(body)
+        # Parallel calls cannot skip an outstanding decision or race two confirmations.
+        if not self._policy_lock.acquire(blocking=False):
+            return {"approved": False, "error": "另一工具正在等待授权，请顺序执行。"}
+        try:
+            with self._runtime_guard:
+                if (body["runtime_nonce"] != self._runtime_nonce
+                        or body["session_id"] != self._active_policy_session
+                        or not self._active_task_id):
+                    raise ValueError("stale runtime or task")
+                task_id = self._active_task_id
+                ticket = self._task_tickets.get(task_id)
+                entry = self._deliveries.get(ticket)
+                if entry is None:
+                    raise ValueError("task channel not bound")
+                message = entry[0]
+                key = (body["caller_session_id"], body["call_id"])
+                if key in self._policy_calls:
+                    raise ValueError("dispatch already decided")
+                self._policy_calls.add(key)
+            if self._confirmations.waiting(task_id=task_id):
+                return {"approved": False, "error": "当前任务正在等待确认。"}
+            automatic = body["tool"] in OBSERVATION_TOOLS or body["tool"] == CONFIRMATION_TOOL
+            if automatic:
+                result = {"approved": True, "status": "policy_allowed"}
+            else:
+                result = self._confirm_from_tool(ticket, confirmation_operation(body))
+            # stop/end/timeout/runtime replacement invalidates approval before returning it.
+            with self._runtime_guard:
+                live = (self._active_task_id == task_id and body["runtime_nonce"] == self._runtime_nonce
+                        and body["session_id"] == self._active_policy_session
+                        and ticket in self._deliveries
+                        and message.session_id not in self._interrupt_requested_for)
+            approved = result.get("approved") is True and live
+            self._record_agent_event(message, "tool.authorization", {
+                "tool_name": body["tool"], "tool_call_id": body["call_id"],
+                "dispatch_digest": digest, "approved": approved,
+                "decision": result.get("status"), "confirmation_id": result.get("confirmation_id"),
+            })
+            return {"approved": approved, "dispatch_digest": digest}
+        finally:
+            self._policy_lock.release()
 
     @property
     def delivery_store(self) -> ConversationJournal:
@@ -356,6 +406,7 @@ class DeepSeekHarnessBackend(ChatBackend):
                     if self._active_chat_session_id == message.session_id:
                         self._active_chat_session_id = None
                         self._active_task_id = None
+                        self._active_policy_session = None
                 self._registry.finish(lease)
 
         finish_reason = getattr(result, "finish_reason", None)
@@ -440,6 +491,7 @@ class DeepSeekHarnessBackend(ChatBackend):
             if self._harness is None:
                 self._harness = self._harness_factory(self._settings)
             harness = self._harness
+            self._active_policy_session = session_id
         callback = lambda notification: self._record_notification(  # noqa: E731
             message,
             session_id,
@@ -634,6 +686,8 @@ class DeepSeekHarnessBackend(ChatBackend):
             harness = self._harness
             self._harness = None
             self._runtime_nonce = uuid4().hex
+            self._active_policy_session = None
+            self._policy_calls.clear()
             self._history_offsets.clear()
         if harness is not None:
             harness.close()
@@ -1037,6 +1091,14 @@ def _create_harness(settings: Settings, *, delivery_env: dict[str, str] | None =
         "DSH_DESKTOP_TOOL_TIMEOUT_MS": str(int(desktop_tool_timeout_seconds * 1000)),
     }
     runtime_env.update(delivery_env or {})
+    patches = tuple(str(path) for path in settings.harness_patch_files)
+    if runtime_env.get("DSH_EXECUTION_POLICY_URL"):
+        policy_directory = Path(__file__).resolve().parents[3] / "config"
+        # Loader names do not evaluate !!js on the shipped binary. Emit a literal URI.
+        policy_patch = settings.harness_session_root / "execution-policy.patch.yml"
+        policy_patch.write_text("- insert:\n    - id: wecom-execution-policy\n      name: "
+            + json.dumps((policy_directory / "execution-policy.mjs").as_uri()) + "\n", encoding="utf-8")
+        patches += (str(policy_patch),)
     if settings.desktop_tools_enabled:
         runtime_env.update(
             {
@@ -1064,7 +1126,7 @@ def _create_harness(settings: Settings, *, delivery_env: dict[str, str] | None =
         runtime_cwd=str(settings.harness_workspace),
         dsh_bin=str(settings.harness_dsh_bin) if settings.harness_dsh_bin else None,
         profile=settings.harness_profile,
-        patches=tuple(str(path) for path in settings.harness_patch_files),
+        patches=patches,
         dsh_home=str(settings.harness_dsh_home),
         env=runtime_env,
         initialize_timeout_seconds=settings.harness_initialize_timeout_seconds,

@@ -168,7 +168,21 @@ Agent 需要明确授权时调用 `request_confirmation(task_ticket, operation)`
 
 等待期间可用控制命令，后台状态为等待确认。拒绝、过期及交互失败会终止所属 Runtime；批准只允许继续该次描述的操作，不代表操作完成。记录保存于渠道 SQLite 的 confirmations 表及渠道事实；数据库中属于旧进程的未决记录仅供审计，不是可恢复授权。
 
-这不是全工具执行级权限隔离：Agent 仍可能不主动申请确认，且描述尚未与所有实际工具参数作强制匹配；相关安全策略仍待实现。不要因此向不可信用户开放任意电脑控制。当前不提供后台替代原用户审批。真实模型集成自测：项目根目录运行 `.\.venv\Scripts\python.exe wechat-aibot-bridge/tests/smoke_harness_confirmation.py`（设置 PYTHONPATH 为 wechat-aibot-bridge/src，使用模拟确认和虚拟操作，不向微信发送文件）。
+意图确认不等于实际工具授权；现在另有下述执行前守卫。当前不提供后台替代原用户审批。真实模型集成自测：项目根目录运行 `.\.venv\Scripts\python.exe wechat-aibot-bridge/tests/smoke_harness_confirmation.py`（设置 PYTHONPATH 为 wechat-aibot-bridge/src，使用模拟确认和虚拟操作，不向微信发送文件）。
+
+### 工具执行前守卫
+
+生产 Bridge 在自定义 Harness 配置后强制追加 `config/execution-policy.mjs` 插件。它接入 `tools/pre-execute`、单调 `tools.guard` 和 `tools/execute`，而不是只修改模型提示词。缺少守卫接口或授权服务时不允许无保护执行；摘要器继续使用独立的全部工具禁用守卫。
+
+- `list_windows`、`inspect_window` 是当前仅有的观察豁免；`request_confirmation` 走原有受校验交互。它们也要通过当前 Runtime、任务及调用身份校验。
+- 其他工具（含文件读取／写入、shell、文件交付、UI 操作、委派以及未知工具）默认每次询问。确认由实际工具名和完整参数生成，不使用模型自述替代参数。暂未提供放宽策略的后台按钮。
+- 每次批准限定当前执行对象及参数；进入执行器前消费，不能用于另一调用、修改后的参数或重试。运行中取消会使未执行批准失效；拒绝／过期停止所属 Runtime。并行授权冲突明确拒绝，Agent 应顺序调用。
+- 参数展示超过1600字符时拒绝，不截断后继续授权。任务票据不在确认文本中展示，但包含在实际调用指纹中。后台事件记录 `tool.authorization`、调用指纹和确认编号。
+- 原生子任务仅在创建元数据可追溯到当前根会话时获得独立逐次校验，否则拒绝；未知/无 Agent 的直接工具执行同样拒绝。真实子任务与 PTC 路径尚未单独验收。
+
+这不是 Windows 进程沙箱：获批 shell 脚本内部的多个动作无法逐个拦截，也不能限制受信任插件、同权限进程或程序内部行为。审批的是这份参数，不保证文件内容／界面不会随后变化；不要批准不理解的脚本。最终回复中的兼容文件标签仍走原交付校验，不属于 Harness 工具调用。尚不建议向不可信用户开放完整电脑控制。
+
+可重复测试：`node wechat-aibot-bridge/tests/test-execution-policy.mjs`；真实 Harness 测试为 `.\.venv\Scripts\python.exe wechat-aibot-bridge/tests/smoke_execution_policy.py`（同样设置 PYTHONPATH，使用现有模型凭据、临时目录及模拟确认，不操作桌面或发微信）。测试要求未批准前无副作用、批准执行一次、拒绝不执行。
 
 ### 应用无关的能力边界
 

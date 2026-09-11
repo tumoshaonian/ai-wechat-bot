@@ -1,6 +1,7 @@
 """Real processor/adapter/HTTP broker, simulated model and channel; no GUI actions."""
 import asyncio
 import json
+from itertools import product
 import re
 import unittest
 import urllib.request
@@ -18,8 +19,8 @@ from test_telemetry import RecordingEvents, Responder
 
 class ConfirmationFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_approve_reject_expire_and_end_through_control_lane(self):
-        for decision in ("approve", "reject", "expire", "end", "stop"):
-            with self.subTest(decision=decision), TemporaryDirectory() as root:
+        for endpoint, decision in product(("confirm", "authorize"), ("approve", "reject", "expire", "end", "stop")):
+            with self.subTest(endpoint=endpoint, decision=decision), TemporaryDirectory() as root:
                 record = RecordingEvents()
                 presented = asyncio.Event()
                 codes = []
@@ -28,8 +29,12 @@ class ConfirmationFlowTests(unittest.IsolatedAsyncioTestCase):
                     closed = False
                     def run(self, content, *, session_id):
                         ticket = backend._task_tickets["original"]
-                        request = urllib.request.Request(backend._broker.url.rsplit("/", 1)[0] + "/confirm",
-                            data=json.dumps({"task_ticket": ticket, "operation": {"action": "测试动作", "target": "虚拟对象", "effect": "仅测试，不操作电脑"}}).encode(),
+                        body = {"task_ticket": ticket, "operation": {"action": "测试动作", "target": "虚拟对象", "effect": "仅测试，不操作电脑"}}
+                        if endpoint == "authorize":
+                            body = {"runtime_nonce": backend._runtime_nonce, "session_id": session_id,
+                                "caller_session_id": session_id, "call_id": "c1", "tool": "test_effect", "arguments": {"target": "virtual"}}
+                        request = urllib.request.Request(backend._broker.url.rsplit("/", 1)[0] + "/" + endpoint,
+                            data=json.dumps(body).encode(),
                             headers={"Authorization": "Bearer " + backend._broker.token})
                         with urllib.request.urlopen(request, timeout=3) as response:
                             result = json.load(response)
@@ -40,7 +45,7 @@ class ConfirmationFlowTests(unittest.IsolatedAsyncioTestCase):
                         self.closed = True
                 runtime = Runtime()
                 backend = DeepSeekHarnessBackend(SimpleNamespace(harness_session_root=Path(root)), harness_factory=lambda _: runtime, event_recorder=record)
-                backend._broker = DeliveryBroker(backend._deliver_from_tool, backend._confirm_from_tool)
+                backend._broker = DeliveryBroker(backend._deliver_from_tool, backend._confirm_from_tool, backend._authorize_dispatch)
                 backend._confirmations.timeout = 0.05 if decision == "expire" else 2
                 processor = MessageProcessor(UnifiedAgentBackend(backend), event_recorder=record, progress_interval_seconds=0.01)
                 class Channel(Responder):

@@ -1,0 +1,53 @@
+import assert from 'node:assert/strict';
+import { apply } from '../config/execution-policy.mjs';
+
+process.env.DSH_EXECUTION_POLICY_URL = 'http://127.0.0.1:12345/authorize';
+process.env.DSH_DELIVERY_TOKEN = 'test';
+process.env.DSH_EXECUTION_POLICY_NONCE = 'runtime';
+const callbacks = new Map();
+let guard;
+apply({ tools: { guard(fn) { guard = fn; } }, on(event, fn) { callbacks.set(event, fn); } });
+callbacks.get('agent/created')({ agent: { session: { id: 'root' } } });
+callbacks.get('agent/created')({ agent: { session: { id: 'child', header: { parentSession: 'root' } } } });
+const execution = (id = 'root') => ({ agent: { session: { id } }, callId: 'c', name: 'bash',
+  arguments: { command: 'test' }, signal: new AbortController().signal });
+const pre = callbacks.get('tools/pre-execute');
+const dispatch = callbacks.get('tools/execute');
+const allow = async () => ({ kind: 'allow' });
+let requests = 0, effects = 0;
+globalThis.fetch = async (_url, opts) => { requests++; assert.equal(JSON.parse(opts.body).session_id, 'root');
+  return { ok: true, json: async () => ({ approved: true }) }; };
+const e = execution();
+assert.match(guard(e), /NOT_APPROVED/); // Skipping pre-policy cannot be undone by an allow listener.
+assert.equal((await pre(e, allow)).kind, 'allow');
+assert.equal(guard(e), undefined);
+await dispatch(e, async () => effects++);
+assert.equal(effects, 1);
+assert.match(guard(e), /NOT_APPROVED/);
+await dispatch(e, async () => effects++);
+assert.equal(effects, 1); // Consumed before dispatch; no second execution.
+const changed = execution();
+await pre(changed, allow);
+changed.arguments.command = 'different';
+assert.match(guard(changed), /NOT_APPROVED/);
+await dispatch(changed, async () => effects++);
+assert.equal(effects, 1);
+const child = execution('child');
+await pre(child, allow);
+assert.equal(guard(child), undefined);
+assert.equal((await pre(execution('unknown'), allow)).kind, 'deny');
+const abort = new AbortController();
+const cancelled = { ...execution(), signal: abort.signal };
+await pre(cancelled, allow); abort.abort();
+await dispatch(cancelled, async () => effects++);
+assert.equal(effects, 1);
+globalThis.fetch = async () => { throw new Error('offline'); };
+const offline = execution();
+assert.equal((await pre(offline, allow)).kind, 'deny');
+assert.match(guard(offline), /NOT_APPROVED/);
+globalThis.fetch = async () => ({ ok: true, json: async () => ({ approved: false }) });
+assert.equal((await pre(execution(), allow)).kind, 'deny');
+globalThis.fetch = async () => ({ ok: true, json: async () => ({ approved: 'false' }) });
+assert.equal((await pre(execution(), allow)).kind, 'deny');
+assert.equal((await pre(execution(), async () => ({ kind: 'deny', reason: 'other policy' }))).kind, 'deny');
+console.log('Execution policy: exact dispatch, single consumption, mutation, children, cancellation and offline checks passed');
