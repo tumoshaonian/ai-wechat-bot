@@ -49,6 +49,10 @@
     eventStream: new AdminEventStream(api),
     eventUnsubscribe: null,
     refreshTimer: null,
+    refreshDirty: false,
+    lastRefresh: 0,
+    rendering: false,
+    backgroundRender: null,
     health: null,
     currentLogs: [],
   };
@@ -218,6 +222,10 @@
   }
 
   function setPage(html) {
+    if (state.backgroundRender?.id === state.renderId) {
+      state.backgroundRender.html = html;
+      return; // Buffer loading and final markup; never flash a skeleton during live updates.
+    }
     $("#page-content").innerHTML = html;
     $("#page-content").focus({ preventScroll: true });
   }
@@ -289,6 +297,9 @@
 
   function authScreen(mode, error = "") {
     clearTimeout(state.refreshTimer); state.refreshTimer = null;
+    state.refreshDirty = false;
+    state.backgroundRender = null;
+    ++state.renderId;
     state.controller?.abort();
     $("#boot-screen").hidden = true;
     $("#app-shell").hidden = true;
@@ -438,16 +449,107 @@
 
   function routeChanged() {
     if ($("#app-shell").hidden) return;
+    clearTimeout(state.refreshTimer); state.refreshTimer = null;
+    state.refreshDirty = false;
     const parsed = parseRoute(); state.route = parsed.name; state.query = parsed.query;
     renderNavigation(); closeDrawer(); closeMobileMenu(); renderCurrentRoute();
   }
 
-  async function renderCurrentRoute() {
+  async function renderCurrentRoute(background = false) {
     const id = ++state.renderId;
+    state.rendering = true;
+    const buffered = background ? { id, html: null } : null;
+    state.backgroundRender = buffered;
+    state.lastRefresh = Date.now();
     state.controller?.abort(); state.controller = new AbortController();
     const renderers = { dashboard: renderDashboard, connections: renderConnections, users: renderUsers, conversations: renderConversations, tasks: renderTasks, configs: renderConfigs, deliveries: renderDeliveries, alerts: renderAlerts, logs: renderLogs, health: renderHealth, maintenance: renderMaintenance, admins: renderAdmins, audit: renderAudit, settings: renderSettings };
-    try { await renderers[state.route](id, state.controller.signal); }
-    catch (error) { if (error?.code !== "REQUEST_TIMEOUT" && state.renderId === id) setPage(pageHeading("无法加载页面", "后台返回了错误") + `<section class="panel">${errorState(error)}</section>`); }
+    try {
+      await renderers[state.route](id, state.controller.signal);
+      if (background && stillRendering(id) && buffered.html !== null) {
+        if (liveUpdateBlocked()) state.refreshDirty = true;
+        else {
+          patchLiveContent(buffered.html);
+          const indicator = $("#live-state"), label = $(".live-label", indicator);
+          if (label.textContent === "更新暂不可用") label.textContent = indicator.classList.contains("connected") ? "实时连接" : "正在重连";
+        }
+      }
+    } catch (error) {
+      if (stillRendering(id)) {
+        if (background) {
+          // Keep readable data on transient failures; bounded retry, not an error-page flash.
+          state.refreshDirty = true;
+          $("#live-state .live-label").textContent = "更新暂不可用";
+        } else if (error?.code !== "REQUEST_TIMEOUT") setPage(pageHeading("无法加载页面", "后台返回了错误") + `<section class="panel">${errorState(error)}</section>`);
+      }
+    } finally {
+      if (stillRendering(id)) {
+        state.backgroundRender = null;
+        state.rendering = false;
+        state.lastRefresh = Date.now();
+        scheduleLiveRefresh();
+      }
+    }
+  }
+
+  const liveEvents = {
+    dashboard: /^(message\.|task\.|connection\.|node\.|service\.|alert\.|runtime\.)/,
+    tasks: /^(task\.|tool\.|confirmation\.|agent\.execution\.)/,
+    connections: /^connection\./,
+    users: /^(user\.|message\.received$)/,
+    conversations: /^(message\.|conversation\.|agent\.session\.|task\.completed$)/,
+    deliveries: /^(artifact\.|delivery\.)/,
+    alerts: /^(alert\.|system\.error$|task\.(failed|timeout)$)/,
+    health: /^(node\.|service\.|runtime\.|connection\.)/,
+    maintenance: /^(node\.|service\.|runtime\.)/,
+  };
+
+  function liveUpdateBlocked() {
+    return document.hidden || $("#modal").open || !$("#drawer-scrim").hidden ||
+      Boolean(document.activeElement?.closest('input,textarea,select,button,[contenteditable="true"]'));
+  }
+
+  function scheduleLiveRefresh() {
+    if (!state.refreshDirty || state.refreshTimer || state.rendering || $("#app-shell").hidden || document.hidden) return;
+    state.refreshTimer = setTimeout(() => {
+      state.refreshTimer = null;
+      if (liveUpdateBlocked()) { scheduleLiveRefresh(); return; }
+      if (state.rendering) return;
+      state.refreshDirty = false;
+      renderCurrentRoute(true);
+    }, Math.max(1000, 5000 - (Date.now() - state.lastRefresh)));
+  }
+
+  document.addEventListener("visibilitychange", scheduleLiveRefresh);
+  document.addEventListener("focusout", scheduleLiveRefresh);
+
+  function patchLiveContent(html) {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const positions = [];
+    for (let node = $("#page-content"); node; node = node.parentElement) positions.push([node, node.scrollTop, node.scrollLeft]);
+    // Existing markup is escaped by the same renderers. Reconcile only changed nodes,
+    // preserving filter drafts, scroll containers and delegated event targets.
+    function sync(parent, desired) {
+      const top = parent.scrollTop, left = parent.scrollLeft;
+      const nextNodes = Array.from(desired.childNodes);
+      for (let i = 0; i < nextNodes.length; i++) {
+        const next = nextNodes[i], current = parent.childNodes[i];
+        if (!current) { parent.append(next.cloneNode(true)); continue; }
+        if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) {
+          current.replaceWith(next.cloneNode(true)); continue;
+        }
+        if (current.isEqualNode(next)) continue;
+        if (current.nodeType !== Node.ELEMENT_NODE) { current.textContent = next.textContent; continue; }
+        if (current.matches("input,textarea,select")) continue;
+        for (const attr of Array.from(current.attributes)) if (!next.hasAttribute(attr.name)) current.removeAttribute(attr.name);
+        for (const attr of next.attributes) if (current.getAttribute(attr.name) !== attr.value) current.setAttribute(attr.name, attr.value);
+        sync(current, next);
+      }
+      while (parent.childNodes.length > nextNodes.length) parent.lastChild.remove();
+      parent.scrollTop = top; parent.scrollLeft = left;
+    }
+    sync($("#page-content"), template.content);
+    for (const [node, top, left] of positions) { node.scrollTop = top; node.scrollLeft = left; }
   }
 
   function stillRendering(id) { return state.renderId === id; }
@@ -456,11 +558,13 @@
     const indicator = $("#live-state");
     if (type === "connected") { indicator.className = "live-state connected"; $(".live-label", indicator).textContent = "实时连接"; return; }
     if (type === "disconnected") { indicator.className = "live-state offline"; $(".live-label", indicator).textContent = "正在重连"; return; }
-    if (type === "unsupported") { indicator.className = "live-state"; $(".live-label", indicator).textContent = "定时刷新"; return; }
+    if (type === "unsupported") { indicator.className = "live-state"; $(".live-label", indicator).textContent = "实时连接不可用 · 可手动刷新"; return; }
+    if (type === "snapshot") { state.refreshDirty = Boolean(liveEvents[state.route]); scheduleLiveRefresh(); return; }
     if (type !== "event") return;
     if (String(detail?.event_type || "").startsWith("log.") && state.route === "logs") appendLiveLog(detail);
-    if (["dashboard", "tasks", "health", "maintenance", "alerts", "connections", "users", "conversations", "deliveries"].includes(state.route) && !state.refreshTimer) {
-      state.refreshTimer = setTimeout(() => { state.refreshTimer = null; renderCurrentRoute(); }, 900);
+    if (liveEvents[state.route]?.test(String(detail?.event_type || ""))) {
+      state.refreshDirty = true;
+      scheduleLiveRefresh();
     }
   }
 

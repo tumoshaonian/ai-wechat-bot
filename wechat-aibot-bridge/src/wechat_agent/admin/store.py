@@ -1694,6 +1694,10 @@ class AdminStore:
                     connection, "service.heartbeat", now, payload
                 )
 
+    def latest_event_sequence(self) -> int:
+        with self.database.connect() as connection:
+            return int(connection.execute("SELECT COALESCE(MAX(seq),0) FROM event_stream").fetchone()[0])
+
     def fetch_events(self, after: int, limit: int = 200) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             rows = connection.execute("SELECT * FROM event_stream WHERE seq>? ORDER BY seq LIMIT ?", (after, limit)).fetchall()

@@ -189,6 +189,7 @@
       this.closed = true;
       this.listeners = new Set();
       this.lastSequence = Number(storageGet(SESSION_KEYS.eventSequence) || 0);
+      this.needsSnapshot = true;
     }
 
     subscribe(listener) {
@@ -210,7 +211,7 @@
         return;
       }
       const after = Number.isFinite(this.lastSequence) ? this.lastSequence : 0;
-      const url = `${this.api.baseUrl}/events/stream?after=${encodeURIComponent(after)}`;
+      const url = `${this.api.baseUrl}/events/stream?after=${encodeURIComponent(after)}&tail=${this.needsSnapshot ? "true" : "false"}`;
       const source = new EventSource(url, { withCredentials: true });
       this.source = source;
       source.onopen = () => {
@@ -218,13 +219,22 @@
         this.emit("connected", {});
       };
       source.onmessage = (event) => this.handleEvent(event);
+      source.addEventListener("cursor", event => {
+        let data; try { data = JSON.parse(event.data); } catch (_) { return; }
+        const sequence = Number(data.seq);
+        if (!Number.isSafeInteger(sequence) || sequence < 0) return;
+        this.lastSequence = sequence;
+        storageSet(SESSION_KEYS.eventSequence, String(sequence));
+        this.needsSnapshot = false;
+        this.emit("snapshot", {}); // One REST reconciliation, not one render per historical event.
+      });
       [
         "message.received", "message.outbound",
-        "task.started", "task.completed", "task.failed", "task.cancelled", "task.timeout", "task.progress",
-        "tool.started", "tool.completed", "tool.failed",
+        "task.received", "task.queued", "task.started", "task.completed", "task.failed", "task.cancelled", "task.timeout", "task.progress", "task.waiting", "task.resumed", "task.policy", "confirmation.resolved",
+        "tool.started", "tool.completed", "tool.failed", "tool.authorization",
         "artifact.created", "artifact.delivery.started", "artifact.delivery.succeeded", "artifact.delivery.failed",
         "connection.created", "connection.updated", "connection.activated", "connection.status_changed", "connection.connecting", "connection.authenticated", "connection.online", "connection.heartbeat", "connection.degraded", "connection.reconnecting", "connection.disconnected", "connection.failed",
-        "node.heartbeat", "node.online", "node.offline", "service.heartbeat", "service.healthy", "service.unhealthy", "service.health_changed",
+        "node.heartbeat", "node.online", "node.offline", "service.heartbeat", "service.healthy", "service.unhealthy", "service.health_changed", "service.health",
         "alert.created", "system.error", "agent.notification", "log.created", "log.python",
       ].forEach((name) => {
         source.addEventListener(name, (event) => this.handleEvent(event));
@@ -241,6 +251,7 @@
       let data;
       try { data = JSON.parse(event.data); } catch (_) { return; }
       const sequence = Number(data?.seq || event.lastEventId || 0);
+      if (sequence > 0 && sequence <= this.lastSequence) return;
       if (sequence > this.lastSequence) {
         this.lastSequence = sequence;
         storageSet(SESSION_KEYS.eventSequence, String(sequence));

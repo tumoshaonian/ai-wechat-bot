@@ -445,9 +445,13 @@ def create_app(
         return store.enqueue_control_command(allowed_actions[action], "service", service, payload={}, idempotency_key=key, actor_id=principal["user"]["id"], ip=_client_ip(request))
 
     @app.get(f"{API_PREFIX}/events/stream", tags=["events"])
-    async def stream_events(request: Request, _p: Annotated[dict[str, Any], Depends(_permission("dashboard.read"))], after: int = Query(0, ge=0)) -> StreamingResponse:
+    async def stream_events(request: Request, _p: Annotated[dict[str, Any], Depends(_permission("dashboard.read"))], after: int = Query(0, ge=0), tail: bool = False) -> StreamingResponse:
         async def generate():
             cursor, silent_polls = after, 0
+            latest = await asyncio.to_thread(store.latest_event_sequence)
+            if tail or cursor > latest:
+                cursor = latest
+                yield f"event: cursor\ndata: {json.dumps({'seq': cursor})}\n\n"
             while not await request.is_disconnected():
                 events = await asyncio.to_thread(store.fetch_events, cursor, 200)
                 if events:
