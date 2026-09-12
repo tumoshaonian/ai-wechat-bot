@@ -603,6 +603,11 @@ class AdminStore:
         return self.get_config_profile(profile_id)
 
     def create_config_revision(self, profile_id: str, data: dict[str, Any], actor_id: str, ip: str | None) -> dict[str, Any]:
+        from ..execution_policy import ExecutionPolicy
+        try:
+            policy = ExecutionPolicy.parse(data.get("tool_policy")).to_dict()
+        except ValueError as exc:
+            raise ConflictError("INVALID_TOOL_POLICY", str(exc)) from exc
         revision_id, now = str(uuid.uuid4()), utcnow()
         with self.transaction() as connection:
             if not connection.execute("SELECT 1 FROM config_profiles WHERE id=?", (profile_id,)).fetchone():
@@ -610,7 +615,7 @@ class AdminStore:
             version = connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM config_revisions WHERE profile_id=?", (profile_id,)).fetchone()[0]
             connection.execute(
                 "INSERT INTO config_revisions(id,profile_id,version,provider,model,system_prompt,request_timeout_seconds,task_timeout_seconds,tool_policy_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (revision_id, profile_id, version, data["provider"], data["model"], data["system_prompt"], data["request_timeout_seconds"], data["task_timeout_seconds"], _json(redact_data(data.get("tool_policy") or {})), actor_id, now),
+                (revision_id, profile_id, version, data["provider"], data["model"], data["system_prompt"], data["request_timeout_seconds"], data["task_timeout_seconds"], _json(policy), actor_id, now),
             )
             connection.execute("UPDATE config_profiles SET updated_at=? WHERE id=?", (now, profile_id))
             self._insert_audit(connection, "admin", actor_id, "config.revision.create", "config_revision", revision_id, "SUCCESS", {"profile_id": profile_id, "version": version, "provider": data["provider"], "model": data["model"]}, ip)
@@ -632,9 +637,14 @@ class AdminStore:
     def publish_config_revision(self, profile_id: str, revision_id: str, actor_id: str, ip: str | None) -> dict[str, Any]:
         now = utcnow()
         with self.transaction() as connection:
-            row = connection.execute("SELECT id FROM config_revisions WHERE id=? AND profile_id=?", (revision_id, profile_id)).fetchone()
+            row = connection.execute("SELECT id,tool_policy_json FROM config_revisions WHERE id=? AND profile_id=?", (revision_id, profile_id)).fetchone()
             if row is None:
                 raise NotFoundError("CONFIG_REVISION_NOT_FOUND", "Config revision was not found")
+            from ..execution_policy import ExecutionPolicy
+            try:
+                ExecutionPolicy.parse(json.loads(row["tool_policy_json"]))
+            except (ValueError, TypeError) as exc:
+                raise ConflictError("INVALID_TOOL_POLICY", "该版本的工具策略无效，请创建修正版本。") from exc
             connection.execute("UPDATE config_revisions SET status='ARCHIVED' WHERE profile_id=? AND status='PUBLISHED'", (profile_id,))
             connection.execute("UPDATE config_revisions SET status='PUBLISHED',published_at=? WHERE id=?", (now, revision_id))
             connection.execute("UPDATE config_profiles SET active_revision_id=?,updated_at=? WHERE id=?", (revision_id, now, profile_id))
@@ -662,6 +672,8 @@ class AdminStore:
                 if isinstance(selected, dict)
                 else ""
             )
+            if setting is not None and not revision_id:
+                raise ConflictError("INVALID_CONFIG_SELECTION", "Published configuration selection is corrupt")
             row = None
             if revision_id:
                 row = connection.execute(
@@ -670,6 +682,8 @@ class AdminStore:
                     "WHERE r.id=? AND p.active_revision_id=r.id",
                     (revision_id,),
                 ).fetchone()
+                if row is None:
+                    raise ConflictError("INVALID_CONFIG_SELECTION", "Selected configuration revision is missing or inactive")
             if row is None:
                 row = connection.execute(
                     "SELECT r.*,p.name AS profile_name FROM config_revisions r "

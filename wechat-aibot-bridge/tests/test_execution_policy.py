@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from wechat_agent.adapters.deepseek_harness import DeepSeekHarnessBackend
 from wechat_agent.domain import IncomingMessage
 from wechat_agent.execution_policy import confirmation_operation, validate_dispatch
+from wechat_agent.execution_policy import ExecutionPolicy
 
 
 class ExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
@@ -43,6 +44,16 @@ class ExecutionPolicyTests(unittest.IsolatedAsyncioTestCase):
         for name in ('mcp__desktop__list_windows', 'mcp__desktop__inspect_window'):
             self.assertTrue(self.backend._authorize_dispatch({**self.body, 'tool': name, 'call_id': name})['approved'])
         self.assertEqual([], self.asked)
+
+    async def test_configured_deny_never_asks_or_approves(self):
+        self.backend._execution_policy = ExecutionPolicy.parse({'rules': {'bash': 'deny'}})
+        self.assertFalse(self.backend._authorize_dispatch(self.body)['approved'])
+        self.assertEqual([], self.asked)
+
+    async def test_observation_can_be_changed_to_ask(self):
+        self.backend._execution_policy = ExecutionPolicy.parse({'rules': {'mcp__desktop__inspect_window': 'ask'}})
+        self.assertTrue(self.backend._authorize_dispatch({**self.body, 'tool': 'mcp__desktop__inspect_window'})['approved'])
+        self.assertEqual(1, len(self.asked))
 
     async def test_replay_rejected_even_with_changed_arguments(self):
         self.backend._authorize_dispatch(self.body)

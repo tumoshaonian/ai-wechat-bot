@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from ..execution_policy import ExecutionPolicy
 
 
 class StrictModel(BaseModel):
@@ -82,6 +83,11 @@ class ConfigRevisionCreate(StrictModel):
     request_timeout_seconds: float = Field(default=450, gt=0, le=7200)
     task_timeout_seconds: float = Field(default=480, gt=0, lt=590)
     tool_policy: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("tool_policy")
+    @classmethod
+    def validate_tool_policy(cls, value):
+        return ExecutionPolicy.parse(value).to_dict()
 
 
 class AlertAction(StrictModel):

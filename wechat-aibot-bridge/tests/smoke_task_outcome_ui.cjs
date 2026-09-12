@@ -11,7 +11,11 @@ const assert = require('node:assert/strict');
     status: 'PARTIAL_SUCCEEDED', duration_ms: 2100, result_summary: '文档已生成',
     error_code: 'FINAL_RESPONSE_SEND_FAILED', error_message: '回复回执丢失，请勿自动重做任务。',
     outcome: { execution_state: 'succeeded', response_status: 'unknown', failure_stage: 'response' },
-    deliveries: [{ id: 'fixture-delivery', status: 'SENT' }], tool_calls: [], events: [],
+    deliveries: [{ id: 'fixture-delivery', status: 'SENT' }], tool_calls: [], events: [
+      { event_type: 'task.policy', payload: { config_revision_id: 'fixture-policy', policy: { default_action: 'ask' } } },
+      { event_type: 'task.waiting', payload: { confirmation_id: 'fixture-confirmation', operation: { action: '<img src=x onerror=alert(1)>', effect: 'fixture-operation' } } },
+      { event_type: 'confirmation.resolved', payload: { confirmation_id: 'fixture-confirmation', status: 'approved', decided_by: 'fixture-owner' } },
+    ],
   };
   const browser = await chromium.launch({ headless: true, channel: 'msedge' });
   try {
@@ -38,6 +42,8 @@ const assert = require('node:assert/strict');
     await page.locator('#drawer-body').getByText('Agent 执行结果', { exact: true }).waitFor();
     const content = await page.locator('#drawer-body').innerText();
     for (const value of ['部分成功', '最终回复回执', '结果未知', '文件交付回执', '已发送', '文档已生成']) assert.ok(content.includes(value), value);
+    for (const value of ['权限与确认记录', 'fixture-owner', 'fixture-policy', 'fixture-operation']) assert.ok(content.includes(value), value);
+    assert.equal(await page.locator('#drawer-body img').count(), 0);
     assert.deepEqual(errors, []);
     await page.locator('#drawer').evaluate(async element => {
       await Promise.all(element.getAnimations({ subtree: true }).map(animation => animation.finished));

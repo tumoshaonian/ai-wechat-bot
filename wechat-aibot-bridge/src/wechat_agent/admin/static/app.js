@@ -828,11 +828,20 @@
       </div>
       <p class="muted">执行结果来自 Agent，具体操作请核对工具证据；回复回执与文件交付分别记录。未知不等于失败，请勿自动重做任务。</p>
       ${can("tasks.control") && active ? `<div class="mt-16"><button class="btn btn-danger" data-action="cancel-task" data-id="${h(task.id)}">停止当前任务</button></div>` : ""}
+      ${authorizationPanel(events)}
       <section class="detail-section"><h3 class="detail-section-title">执行时间线</h3>${events.length ? `<div class="timeline">${events.map(eventTimelineItem).join("")}</div>` : emptyState("暂无结构化事件", "任务存在，但执行阶段尚未写入事件流。")}</section>
       <section class="detail-section"><h3 class="detail-section-title">工具调用（${tools.length}）</h3>${tools.length ? `<div class="timeline">${tools.map(toolTimelineItem).join("")}</div>` : emptyState("没有工具调用", "这可能是一条纯文本回答，或工具事件尚未接入。")}</section>
       ${task.artifacts?.length ? `<section class="detail-section"><h3 class="detail-section-title">文件产物</h3>${task.artifacts.map((file) => `<div class="detail-field" style="margin-bottom:8px"><span>${h(file.kind || "file")}</span><strong>${h(file.name)} · ${h(formatBytes(file.size_bytes))}</strong></div>`).join("")}</section>` : ""}`;
       if (task.deliveries?.length) $("#drawer-body").insertAdjacentHTML("beforeend", `<section class="detail-section"><h3 class="detail-section-title">文件交付回执</h3>${task.deliveries.map((delivery) => `<div class="detail-field"><span>${h(delivery.id)}</span><strong>${statusBadge(delivery.status)} ${h(delivery.error_message || "")}</strong></div>`).join("")}</section>`);
     } catch (error) { $("#drawer-body").innerHTML = errorState(error); }
+  }
+
+  function authorizationPanel(events) {
+    const selected = events.filter(e => ["task.policy", "task.waiting", "confirmation.resolved", "tool.authorization"].includes(e.event_type));
+    return `<section class="detail-section"><h3 class="detail-section-title">权限与确认记录</h3><p class="muted">批准不代表执行成功；核对下方工具结果。旧记录缺失字段不推定为已批准。</p>${selected.length ? selected.map(e => {
+      const p = e.payload || parseJson(e.payload_json);
+      return `<article class="panel"><div class="panel-body"><strong>${h(e.event_type)}</strong><pre class="code-block">${h(JSON.stringify(p, null, 2))}</pre></div></article>`;
+    }).join("") : '<p class="muted">暂无权限记录</p>'}</section>`;
   }
 
   function eventTimelineItem(item) {
@@ -906,18 +915,33 @@
   function configRevisionCard(profile, revision) {
     const active = profile.active_revision_id === revision.id;
     const toolPolicy = parseJson(revision.tool_policy_json || revision.tool_policy);
-    return `<article class="panel" style="margin-bottom:12px"><div class="panel-header"><div><h3>v${h(revision.version)} · ${h(revision.provider)} / ${h(revision.model)}</h3><p>${h(formatFullDate(revision.created_at))}</p></div>${active ? '<span class="badge badge-success">当前生效</span>' : statusBadge(revision.status)}</div><div class="panel-body"><div class="detail-grid">${detailField("请求超时", `${revision.request_timeout_seconds} 秒`)}${detailField("任务超时", `${revision.task_timeout_seconds} 秒`)}${detailField("系统提示词", h(clipped(revision.system_prompt, 260)), true, true)}${detailField("工具策略", `<span class="mono">${h(clipped(JSON.stringify(toolPolicy), 220) || "{}")}</span>`, true, true)}</div>${can("configs.publish") && !active ? `<div class="mt-16 flex gap-8"><button class="btn btn-primary btn-sm" data-action="publish-config" data-profile-id="${h(profile.id)}" data-revision-id="${h(revision.id)}" data-version="${h(revision.version)}">发布此版本</button>${String(revision.status).toUpperCase() !== "DRAFT" ? `<button class="btn btn-sm" data-action="rollback-config" data-profile-id="${h(profile.id)}" data-revision-id="${h(revision.id)}" data-version="${h(revision.version)}">回滚到此版本</button>` : ""}</div>` : ""}</div></article>`;
+    return `<article class="panel" style="margin-bottom:12px"><div class="panel-header"><div><h3>v${h(revision.version)} · ${h(revision.provider)} / ${h(revision.model)}</h3><p>${h(formatFullDate(revision.created_at))}</p></div>${active ? '<span class="badge badge-success">已发布 · 重启后加载</span>' : statusBadge(revision.status)}</div><div class="panel-body"><div class="detail-grid">${detailField("请求超时", `${revision.request_timeout_seconds} 秒`)}${detailField("任务超时", `${revision.task_timeout_seconds} 秒`)}${detailField("系统提示词", h(clipped(revision.system_prompt, 260)), true, true)}${detailField("工具策略（完整配置）", `<pre class="code-block">${h(JSON.stringify(toolPolicy, null, 2))}</pre>`, true, true)}</div>${can("configs.publish") && !active ? `<div class="mt-16 flex gap-8"><button class="btn btn-primary btn-sm" data-action="publish-config" data-profile-id="${h(profile.id)}" data-revision-id="${h(revision.id)}" data-version="${h(revision.version)}">发布此版本</button>${String(revision.status).toUpperCase() !== "DRAFT" ? `<button class="btn btn-sm" data-action="rollback-config" data-profile-id="${h(profile.id)}" data-revision-id="${h(revision.id)}" data-version="${h(revision.version)}">回滚到此版本</button>` : ""}</div>` : ""}</div></article>`;
+  }
+
+  const observationTools = ["mcp__desktop__list_windows", "mcp__desktop__inspect_window"];
+  function executionPolicyFields() {
+    return `<h3>执行权限策略</h3><p class="muted">新版本使用下列显式策略；发布后重启 Bridge 生效，不修改运行中任务。只有观察工具支持自动允许，其他工具只能确认或禁止。</p><label class="field"><span>未单独配置的工具</span><select name="policy_default"><option value="ask">要求确认</option><option value="deny">禁止</option></select></label><label class="field"><span>确认时限（10–90 秒，计入任务总时限）</span><input name="confirmation_timeout" type="number" min="10" max="90" step="1" value="90"></label>${observationTools.map((tool, i) => `<label class="field"><span>${h(tool)}</span><select name="observation_${i}"><option value="allow">自动允许</option><option value="ask">要求确认</option><option value="deny">禁止</option></select></label>`).join("")}<label class="field"><span>其他精确工具规则（每行 工具名=ask 或 工具名=deny）</span><textarea name="policy_rules" class="mono" placeholder="bash=ask&#10;mcp__desktop__invoke=ask"></textarea></label>`;
+  }
+  function readExecutionPolicy(values) {
+    const timeout = Number(values.confirmation_timeout);
+    if (!Number.isInteger(timeout) || timeout < 10 || timeout > 90) throw new Error("确认时限必须为10–90秒的整数。");
+    const rules = Object.fromEntries(observationTools.map((tool, i) => [tool, values[`observation_${i}`]]));
+    for (const line of (values.policy_rules || "").split(/\r?\n/).map(x => x.trim()).filter(Boolean)) {
+      const match = /^([A-Za-z0-9_.-]{1,128})\s*=\s*(ask|deny)$/.exec(line);
+      if (!match || Object.hasOwn(rules, match[1]) || match[1] === "mcp__desktop__request_confirmation") throw new Error("规则格式无效、工具重复或试图修改确认通道。");
+      Object.defineProperty(rules, match[1], { value: match[2], enumerable: true });
+    }
+    return { version: 1, default_action: values.policy_default, confirmation_timeout_seconds: timeout, rules };
   }
 
   function configRevisionForm(profileId) {
     showModal({
       title: "创建 Agent 配置版本", eyebrow: "IMMUTABLE REVISION", confirmLabel: "创建草稿版本",
-      body: `<form id="config-revision-form" class="form-stack"><div class="detail-grid"><label class="field"><span>Provider</span><input name="provider" required maxlength="100" value="deepseek-harness"></label><label class="field"><span>模型</span><input name="model" required maxlength="200" placeholder="模型标识"></label></div><label class="field"><span>系统提示词</span><textarea name="system_prompt" required maxlength="200000" style="min-height:180px" placeholder="描述 Agent 的职责、安全边界和工作方式"></textarea></label><div class="detail-grid"><label class="field"><span>Harness 请求超时（秒）</span><input name="request_timeout_seconds" type="number" min="1" max="7200" value="450"></label><label class="field"><span>单任务超时（秒）</span><input name="task_timeout_seconds" type="number" min="1" max="589" value="480"></label></div><label class="field"><span>工具策略（JSON）</span><textarea name="tool_policy" class="mono" placeholder='{"allow_desktop": true}'>{}</textarea></label><div class="form-alert" data-form-error hidden></div></form>`,
+      body: `<form id="config-revision-form" class="form-stack"><div class="detail-grid"><label class="field"><span>Provider</span><input name="provider" required maxlength="100" value="deepseek"></label><label class="field"><span>模型</span><input name="model" required maxlength="200" placeholder="模型标识"></label></div><label class="field"><span>系统提示词</span><textarea name="system_prompt" required maxlength="200000" style="min-height:180px" placeholder="描述 Agent 的职责、安全边界和工作方式"></textarea></label><div class="detail-grid"><label class="field"><span>Harness 请求超时（秒）</span><input name="request_timeout_seconds" type="number" min="1" max="7200" value="450"></label><label class="field"><span>单任务超时（秒）</span><input name="task_timeout_seconds" type="number" min="1" max="589" value="480"></label></div>${executionPolicyFields()}<div class="form-alert" data-form-error hidden></div></form>`,
       onConfirm: async (modal) => {
         const form = $("#config-revision-form", modal), values = Object.fromEntries(new FormData(form));
         if (!values.provider.trim() || !values.model.trim() || !values.system_prompt.trim()) return showInlineFormError(form, "Provider、模型和系统提示词不能为空。");
-        let policy; try { policy = JSON.parse(values.tool_policy || "{}"); } catch (_) { return showInlineFormError(form, "工具策略必须是合法 JSON。"); }
-        if (!policy || Array.isArray(policy) || typeof policy !== "object") return showInlineFormError(form, "工具策略必须是 JSON 对象。");
+        let policy; try { policy = readExecutionPolicy(values); } catch (e) { return showInlineFormError(form, e.message); }
         const requestTimeout = Number(values.request_timeout_seconds), taskTimeout = Number(values.task_timeout_seconds);
         if (!(requestTimeout > 0 && requestTimeout <= 7200 && taskTimeout > 0 && taskTimeout < 590)) return showInlineFormError(form, "超时数值超出允许范围。");
         await api.post(`/config-profiles/${encodeURIComponent(profileId)}/revisions`, { provider: values.provider.trim(), model: values.model.trim(), system_prompt: values.system_prompt, request_timeout_seconds: requestTimeout, task_timeout_seconds: taskTimeout, tool_policy: policy });

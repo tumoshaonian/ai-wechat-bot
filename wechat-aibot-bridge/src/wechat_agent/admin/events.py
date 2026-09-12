@@ -195,13 +195,17 @@ class AdminEventRecorder:
             LOGGER.exception("Could not load the WeCom user capability policy")
             return {}
 
-    def get_active_runtime_config(self) -> dict[str, Any] | None:
+    def get_active_runtime_config(self, *, strict: bool = False) -> dict[str, Any] | None:
         if self.store is None:
+            if strict:
+                raise RuntimeError("Published configuration store is unavailable")
             return None
         try:
             return self.store.get_active_runtime_config()
         except Exception:
             LOGGER.exception("Could not load the published Agent configuration")
+            if strict:
+                raise
             return None
 
 

@@ -10,9 +10,10 @@ from wechat_agent.adapters.deepseek_harness import DeepSeekHarnessBackend, _crea
 from wechat_agent.adapters.unified_agent import UnifiedAgentBackend
 from wechat_agent.config import Settings
 from wechat_agent.domain import IncomingMessage, AgentTaskInterrupted
+from wechat_agent.execution_policy import ExecutionPolicy
 
 
-async def check(approve):
+async def check(approve, blocked=False):
     settings = Settings.from_environment()
     bridge = Path(__file__).resolve().parents[1]
     with TemporaryDirectory(prefix='execution-policy-smoke-') as temporary:
@@ -21,7 +22,9 @@ async def check(approve):
         patch.write_text('- insert:\n    - id: policy-probe\n      name: ' + json.dumps(
             (bridge / 'tests' / 'policy-effect-probe.mjs').as_uri()) + '\n', encoding='utf-8')
         settings = replace(settings, harness_session_root=root/'journal', harness_dsh_home=root/'home',
-            harness_workspace=root, desktop_tools_enabled=False, harness_patch_files=(patch,))
+            harness_workspace=root, desktop_tools_enabled=False, harness_patch_files=(patch,),
+            execution_policy=ExecutionPolicy.parse({'confirmation_timeout_seconds': 30,
+                'rules': {'policy_test_effect': 'deny'} if blocked else {}}))
         backend = DeepSeekHarnessBackend(settings)
         from wechat_agent.delivery_broker import DeliveryBroker
         backend._broker = DeliveryBroker(backend._deliver_from_tool, backend._confirm_from_tool, backend._authorize_dispatch)
@@ -51,15 +54,15 @@ async def check(approve):
         try:
             try:
                 result = await backend.reply(message)
-                assert approve, 'rejection must interrupt the task'
+                assert approve or blocked, 'rejection must interrupt the task'
                 assert result.text
             except AgentTaskInterrupted:
                 assert not approve
-            assert len(prompts) == 1, prompts
-            assert proof.exists() == approve
-            if approve:
+            assert len(prompts) == (0 if blocked else 1), prompts
+            assert proof.exists() == (approve and not blocked)
+            if approve and not blocked:
                 assert json.loads(proof.read_text()) == {'effects': 1}
-            print(json.dumps({'approved': approve, 'confirmation_count': len(prompts),
+            print(json.dumps({'approved': approve, 'policy_denied': blocked, 'confirmation_count': len(prompts),
                 'effect_executed': proof.exists(), 'channel': 'simulated owner; no WeCom/desktop actions'}), flush=True)
         finally:
             unconfirm(); unbind()
@@ -69,6 +72,7 @@ async def check(approve):
 async def main():
     await check(True)
     await check(False)
+    await check(False, blocked=True)
 
 
 if __name__ == '__main__':

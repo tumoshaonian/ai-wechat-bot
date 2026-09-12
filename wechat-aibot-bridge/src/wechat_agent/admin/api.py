@@ -122,7 +122,7 @@ def create_app(
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
         safe_errors = [
-            {key: value for key, value in error.items() if key != "input"}
+            {key: value for key, value in error.items() if key not in {"input", "ctx"}}
             for error in exc.errors()
         ]
         return _error(request, 422, "VALIDATION_ERROR", "Request validation failed", safe_errors)

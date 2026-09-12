@@ -21,7 +21,7 @@ from ..domain import AgentReply, AgentTaskInterrupted, IncomingMessage, UserVisi
 from ..ports import ChatBackend
 from ..conversation_journal import ConversationJournal
 from ..confirmations import ConfirmationCoordinator
-from ..execution_policy import OBSERVATION_TOOLS, CONFIRMATION_TOOL, validate_dispatch, confirmation_operation
+from ..execution_policy import ExecutionPolicy, validate_dispatch, confirmation_operation
 from ..history_recovery import recover_context
 from .harness_summary import summarize_history
 from ..session_registry import HarnessConversationStatus, HarnessSessionLease, HarnessSessionRegistry
@@ -80,7 +80,8 @@ class DeepSeekHarnessBackend(ChatBackend):
         self._runtime_guard = threading.RLock()
         self._registry = HarnessSessionRegistry(settings.harness_session_root)
         self._journal = ConversationJournal(settings.harness_session_root)
-        self._confirmations = ConfirmationCoordinator(self._journal)
+        self._execution_policy = getattr(settings, "execution_policy", ExecutionPolicy())
+        self._confirmations = ConfirmationCoordinator(self._journal, timeout_seconds=self._execution_policy.confirmation_timeout_seconds)
         self._confirmation_presenters = {}
         self._runtime_nonce = uuid4().hex
         self._active_policy_session = None
@@ -131,8 +132,10 @@ class DeepSeekHarnessBackend(ChatBackend):
                 self._policy_calls.add(key)
             if self._confirmations.waiting(task_id=task_id):
                 return {"approved": False, "error": "当前任务正在等待确认。"}
-            automatic = body["tool"] in OBSERVATION_TOOLS or body["tool"] == CONFIRMATION_TOOL
-            if automatic:
+            action = self._execution_policy.action(body["tool"])
+            if action == "deny":
+                result = {"approved": False, "status": "policy_denied"}
+            elif action == "allow":
                 result = {"approved": True, "status": "policy_allowed"}
             else:
                 result = self._confirm_from_tool(ticket, confirmation_operation(body))
@@ -147,6 +150,7 @@ class DeepSeekHarnessBackend(ChatBackend):
                 "tool_name": body["tool"], "tool_call_id": body["call_id"],
                 "dispatch_digest": digest, "approved": approved,
                 "decision": result.get("status"), "confirmation_id": result.get("confirmation_id"),
+                "config_revision_id": getattr(self._settings, "agent_config_revision_id", None),
             })
             return {"approved": approved, "dispatch_digest": digest}
         finally:
@@ -492,6 +496,11 @@ class DeepSeekHarnessBackend(ChatBackend):
                 self._harness = self._harness_factory(self._settings)
             harness = self._harness
             self._active_policy_session = session_id
+        self._record_agent_event(message, "task.policy", {
+            "config_revision_id": getattr(self._settings, "agent_config_revision_id", None),
+            "policy": self._execution_policy.to_dict(),
+            "task_timeout_seconds": getattr(self._settings, "task_timeout_seconds", None),
+        })
         callback = lambda notification: self._record_notification(  # noqa: E731
             message,
             session_id,

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
+from .execution_policy import ExecutionPolicy
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -60,6 +61,7 @@ class Settings:
     bridge_shutdown_file: Path
     agent_config_revision_id: str | None
     harness_recovery_max_bytes: int = 196608
+    execution_policy: ExecutionPolicy = ExecutionPolicy()
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -67,6 +69,10 @@ class Settings:
 
         load_dotenv(PROJECT_ROOT / ".env", override=False)
         active_agent_config = _admin_active_agent_config()
+        try:
+            execution_policy = ExecutionPolicy.parse(active_agent_config.get("tool_policy", {}) if active_agent_config else {})
+        except ValueError as exc:
+            raise ConfigurationError(f"已发布工具策略无效：{exc}；请修正配置后重启。") from exc
         active_connection = _admin_active_connection()
         if active_connection is not None:
             bot_id = active_connection["bot_id"]
@@ -308,6 +314,7 @@ class Settings:
             desktop_log_file=desktop_log_file,
             doubao_launch_path=doubao_launch_path,
             bridge_shutdown_file=bridge_shutdown_file,
+            execution_policy=execution_policy,
             agent_config_revision_id=(
                 str(active_agent_config.get("id"))
                 if active_agent_config is not None
@@ -348,11 +355,13 @@ def _admin_active_agent_config() -> dict[str, object] | None:
     try:
         from .admin.events import get_event_recorder
 
-        value = get_event_recorder().get_active_runtime_config()
-    except Exception:
+        value = get_event_recorder().get_active_runtime_config(strict=True)
+    except Exception as exc:
+        raise ConfigurationError("无法读取后台发布配置；为避免绕过工具禁用规则，拒绝启动。") from exc
+    if value is None:
         return None
     if not isinstance(value, dict):
-        return None
+        raise ConfigurationError("后台发布配置格式无效，拒绝回退到默认权限。")
     required = {
         "id",
         "provider",
@@ -362,7 +371,7 @@ def _admin_active_agent_config() -> dict[str, object] | None:
         "task_timeout_seconds",
     }
     if not required.issubset(value):
-        return None
+        raise ConfigurationError("后台发布配置缺少必要字段，拒绝回退到默认权限。")
     return value
 
 

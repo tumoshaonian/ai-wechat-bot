@@ -63,6 +63,22 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(409, repeated.status_code)
         self.assertEqual("SETUP_ALREADY_COMPLETED", repeated.json()["detail"]["code"])
 
+    def test_tool_policy_validation_and_published_snapshot(self):
+        login = self.bootstrap_and_login(mode="token")
+        headers = {"Authorization": f"Bearer {login['access_token']}"}
+        profile = self.client.post(f"{API_PREFIX}/config-profiles", headers=headers, json={"name": "Policy"}).json()
+        endpoint = f"{API_PREFIX}/config-profiles/{profile['id']}/revisions"
+        body = dict(provider="deepseek", model="test", system_prompt="test", tool_policy={"rules": {"bash": "allow"}})
+        response = self.client.post(endpoint, headers=headers, json=body)
+        self.assertEqual(422, response.status_code, response.text)
+        body['tool_policy'] = {'rules': {'bash': 'deny'}, 'confirmation_timeout_seconds': 30}
+        revision = self.client.post(endpoint, headers=headers, json=body)
+        self.assertEqual(201, revision.status_code, revision.text)
+        result = self.client.post(endpoint + '/' + revision.json()['id'] + '/publish', headers=headers, json={})
+        self.assertEqual(200, result.status_code, result.text)
+        self.assertTrue(result.json()['needs_restart'])
+        self.assertEqual('deny', self.store.get_active_runtime_config()['tool_policy']['rules']['bash'])
+
     def test_cookie_auth_requires_csrf_for_mutation(self) -> None:
         login = self.bootstrap_and_login()
         self.assertEqual(200, self.client.get(f"{API_PREFIX}/dashboard/summary").status_code)

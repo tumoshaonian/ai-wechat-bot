@@ -62,7 +62,8 @@ class ConfirmationCoordinator:
             ))
         future = asyncio.get_running_loop().create_future()
         self.waiters[code] = (message, future)
-        event("task.waiting", {"state": "waiting_confirmation", "confirmation_id": code, "operation_digest": digest})
+        event("task.waiting", {"state": "waiting_confirmation", "confirmation_id": code, "operation_digest": digest,
+              "operation": json.loads(canonical), "requested_user": message.sender_id, "expires_at": now + self.timeout})
         status = "cancelled"
         try:
             # A proposal is untrusted agent text, rendered as plain channel text.
@@ -90,7 +91,8 @@ class ConfirmationCoordinator:
                 "confirmation_id": code, "operation": json.loads(canonical), "status": status,
                 "operation_digest": digest, "meaning": "仅记录本次确认交互，不代表操作已执行或完成，不可复用为新的授权。",
             })
-            event("confirmation.resolved", {"confirmation_id": code, "status": status, "operation_digest": digest})
+            event("confirmation.resolved", {"confirmation_id": code, "status": status, "operation_digest": digest,
+                  "decided_by": message.sender_id if status in {"approved", "rejected"} else None})
             if status == "approved":
                 event("task.resumed", {"state": "running", "confirmation_id": code, "decision": status})
 
